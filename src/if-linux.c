@@ -1700,6 +1700,19 @@ if_checkipv6(struct dhcpcd_ctx *ctx, const struct interface *ifp)
 	return ra;
 }
 
+int
+ip6_forwarding(const char *ifname)
+{
+	char path[256];
+	int val;
+
+	if (ifname == NULL)
+		ifname = "all";
+	snprintf(path, sizeof(path), "%s/%s/forwarding", prefix, ifname);
+	val = check_proc_int(path);
+	return val == -1 ? 0 : val;
+}
+
 #ifdef IPV6_MANAGETEMPADDR
 int
 ip6_use_tempaddr(const char *ifname)

@@ -1421,4 +1421,11 @@ if_checkipv6(__unused struct dhcpcd_ctx *ctx,
 
 	return 0;
 }
+
+int
+ip6_forwarding(__unused const char *ifname)
+{
+
+	return 0;
+}
 #endif

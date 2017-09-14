@@ -1393,6 +1393,7 @@ dhcp6_dadcallback(void *arg)
 				if (valid)
 					dhcpcd_daemonise(ifp->ctx);
 			}
+			ipv6nd_advertise(ia);
 		}
 	}
 }

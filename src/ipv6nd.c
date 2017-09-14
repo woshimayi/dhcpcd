@@ -34,6 +34,7 @@
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -325,6 +326,136 @@ ipv6nd_sendrsprobe(void *arg)
 		ipv6nd_drop(ifp);
 		dhcp6_dropnondelegates(ifp);
 	}
+}
+
+static void
+ipv6nd_sendadvertisement(void *arg)
+{
+	struct ipv6_addr *ia = arg;
+	struct interface *ifp = ia->iface;
+	struct dhcpcd_ctx *ctx = ifp->ctx;
+	struct sockaddr_in6 dst;
+	struct cmsghdr *cm;
+	struct in6_pktinfo pi;
+	const struct rs_state *state = RS_CSTATE(ifp);
+
+	/* If no state (intial init, learning) or no carrier,
+	 * just free the advertisemnt stop. */
+	if (state == NULL || ifp->carrier == LINK_DOWN)
+		goto freeit;
+
+	memset(&dst, 0, sizeof(dst));
+	dst.sin6_family = AF_INET6;
+#ifdef SIN6_LEN
+	dst.sin6_len = sizeof(dst);
+#endif
+	dst.sin6_scope_id = ifp->index;
+	if (inet_pton(AF_INET6, ALLNODES, &dst.sin6_addr) != 1) {
+		logerr(__func__);
+		return;
+	}
+
+	ctx->sndhdr.msg_name = (void *)&dst;
+	ctx->sndhdr.msg_iov[0].iov_base = ia->na;
+	ctx->sndhdr.msg_iov[0].iov_len = ia->nalen;
+
+	/* Set the outbound interface */
+	cm = CMSG_FIRSTHDR(&ctx->sndhdr);
+	if (cm == NULL) /* unlikely */
+		return;
+	cm->cmsg_level = IPPROTO_IPV6;
+	cm->cmsg_type = IPV6_PKTINFO;
+	cm->cmsg_len = CMSG_LEN(sizeof(pi));
+	memset(&pi, 0, sizeof(pi));
+	pi.ipi6_ifindex = ifp->index;
+	memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+
+	logdebugx("%s: sending NA for %s", ifp->name, ia->saddr);
+	if (sendmsg(ctx->nd_fd, &ctx->sndhdr, 0) == -1) {
+		logerr(__func__);
+		/* Allow IPv6ND to continue .... at most a few errors
+		 * would be logged.
+		 * Generally the error is ENOBUFS when struggling to
+		 * associate with an access point. */
+	}
+
+	if (++ia->nna < MAX_NEIGHBOR_ADVERTISEMENT) {
+		eloop_timeout_add_sec(ifp->ctx->eloop,
+		    state->retrans / 1000, ipv6nd_sendadvertisement, ia);
+	} else {
+freeit:
+		free(ia->na);
+		ia->na = NULL;
+		ia->nalen = 0;
+	}
+}
+
+void
+ipv6nd_advertise(struct ipv6_addr *ia)
+{
+	struct interface *ifp;
+	struct ipv6_addr *iap, *ial;
+	struct nd_neighbor_advert *na;
+
+	assert(ia->iface->ctx != NULL);
+
+	if (IN6_IS_ADDR_MULTICAST(&ia->addr))
+		return;
+
+	/* Find the most preferred address to advertise. */
+	iap = ial = NULL;
+	TAILQ_FOREACH(ifp, ia->iface->ctx->ifaces, next) {
+		struct ipv6_state *state = IPV6_STATE(ifp);
+		struct ipv6_addr *ia2;
+
+		if (state == NULL)
+			continue;
+		TAILQ_FOREACH(ia2, &state->addrs, next) {
+			if (!IN6_ARE_ADDR_EQUAL(&ia2->addr, &ia->addr))
+				continue;
+			if (iap == NULL)
+				iap = ia2;
+			/* Cancel any current advertisement. */
+			eloop_timeout_delete(ifp->ctx->eloop,
+			    ipv6nd_sendadvertisement, ia2);
+		}
+	}
+	if (iap == NULL)
+		return;
+
+	ifp = iap->iface;
+
+	/* Make the packet. */
+	iap->nalen = sizeof(*na);
+	if (ifp->hwlen != 0)
+		iap->nalen += (size_t)ROUNDUP8(ifp->hwlen + 2);
+	na = calloc(1, iap->nalen);
+	if (na == NULL) {
+		logerr(__func__);
+		return;
+	}
+
+	na->nd_na_type = ND_NEIGHBOR_ADVERT;
+	na->nd_na_flags_reserved = ND_NA_FLAG_OVERRIDE;
+	if (ip6_forwarding(ifp->name) == 1)
+		na->nd_na_flags_reserved |= ND_NA_FLAG_ROUTER;
+	na->nd_na_target = ia->addr;
+
+	if (ifp->hwlen != 0) {
+		struct nd_opt_hdr *nd;
+
+		nd = (struct nd_opt_hdr *)(na + 1);
+		nd->nd_opt_type = ND_OPT_TARGET_LINKADDR;
+		nd->nd_opt_len = (uint8_t)((ROUNDUP8(ifp->hwlen + 2)) >> 3);
+		memcpy(nd + 1, ifp->hwaddr, ifp->hwlen);
+	}
+
+	/* Start advertising. */
+	iap->nna = 0;
+	free(iap->na);
+	iap->na = na;
+	eloop_timeout_delete(ifp->ctx->eloop, ipv6nd_sendadvertisement, iap);
+	ipv6nd_sendadvertisement(iap);
 }
 
 void
@@ -706,6 +837,7 @@ try_script:
 					return;
 			}
 		}
+		ipv6nd_advertise(ia);
 	}
 }
 
@@ -852,8 +984,11 @@ ipv6nd_handlera(struct dhcpcd_ctx *ctx, struct interface *ifp,
 		if (rap->reachable > MAX_REACHABLE_TIME)
 			rap->reachable = 0;
 	}
-	if (nd_ra->nd_ra_retransmit)
-		rap->retrans = ntohl(nd_ra->nd_ra_retransmit);
+	if (nd_ra->nd_ra_retransmit) {
+		struct rs_state *state = RS_STATE(ifp);
+
+		state->retrans = rap->retrans = ntohl(nd_ra->nd_ra_retransmit);
+	}
 	if (rap->lifetime)
 		rap->expired = 0;
 	rap->hasdns = 0;
@@ -1619,6 +1754,7 @@ ipv6nd_startrs1(void *arg)
 		return;
 	}
 
+	state->retrans = RETRANS_TIMER;
 	state->rsprobes = 0;
 	ipv6nd_sendrsprobe(ifp);
 }

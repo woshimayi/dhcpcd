@@ -1543,4 +1543,17 @@ if_checkipv6(struct dhcpcd_ctx *ctx, const struct interface *ifp)
 	ctx->ra_global = ra;
 	return ra;
 }
+
+int
+ip6_forwarding(__unused const char *ifname)
+{
+	int val;
+
+#ifdef IPV6CTL_FORWARDING
+	val = get_inet6_sysctl(IPV6CTL_FORWARDING);
+#else
+	val = get_inet6_sysctlbyname("net.inet6.ip6.forwarding");
+#endif
+	return val < 0 ? TEMP_VALID_LIFETIME : val;
+}
 #endif
