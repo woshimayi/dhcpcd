@@ -1893,7 +1893,7 @@ dhcp_expire(void *arg)
 	dhcp_expire1(ifp);
 }
 
-#ifdef ARP
+#if defined(ARP) || defined(IN_IFF_DUPLICATED)
 static void
 dhcp_decline(struct interface *ifp)
 {
@@ -3747,10 +3747,10 @@ dhcp_start(struct interface *ifp)
 void
 dhcp_abort(struct interface *ifp)
 {
-#ifdef ARPING
 	struct dhcp_state *state;
 
 	state = D_STATE(ifp);
+#ifdef ARPING
 	if (state != NULL)
 		state->arping_index = -1;
 #endif

@@ -297,6 +297,10 @@ bpf_close(struct interface *ifp, int fd)
 	return close(fd);
 }
 
+/* Guard this functon with ARP.
+ * This can be removed if we solve the shared IP on many interfaces problem
+ * noted in the bootp tests below. */
+#ifdef ARP
 static unsigned int
 bpf_cmp_hwaddr(struct bpf_insn *bpf, size_t bpf_len, size_t off,
     bool equal, uint8_t *hwaddr, size_t hwaddr_len)
@@ -380,6 +384,7 @@ bpf_cmp_hwaddr(struct bpf_insn *bpf, size_t bpf_len, size_t off,
 
 	return (unsigned int)(bp - bpf);
 }
+#endif
 
 #ifdef ARP
 
