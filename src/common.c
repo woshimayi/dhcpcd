@@ -1,6 +1,7 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * dhcpcd - DHCP client daemon
- * Copyright (c) 2006-2018 Roy Marples <roy@marples.name>
+ * Copyright (c) 2006-2020 Roy Marples <roy@marples.name>
  * All rights reserved
 
  * Redistribution and use in source and binary forms, with or without
@@ -25,84 +26,19 @@
  * SUCH DAMAGE.
  */
 
-#include <sys/param.h>
-#include <sys/time.h>
-#ifdef __sun
-#include <sys/sysmacros.h>
-#endif
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 
-#include <assert.h>
 #include <ctype.h>
-#include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
-#ifdef BSD
-#  include <paths.h>
-#endif
-#include <stdarg.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "common.h"
 #include "dhcpcd.h"
 #include "if-options.h"
-#include "logerr.h"
-
-/* Most route(4) messages are less than 256 bytes. */
-#define IOVEC_BUFSIZ	256
-
-ssize_t
-setvar(char **e, const char *prefix, const char *var, const char *value)
-{
-	size_t len = strlen(var) + strlen(value) + 3;
-
-	if (prefix)
-		len += strlen(prefix) + 1;
-	if ((*e = malloc(len)) == NULL) {
-		logerr(__func__);
-		return -1;
-	}
-	if (prefix)
-		snprintf(*e, len, "%s_%s=%s", prefix, var, value);
-	else
-		snprintf(*e, len, "%s=%s", var, value);
-	return (ssize_t)len;
-}
-
-ssize_t
-setvard(char **e, const char *prefix, const char *var, size_t value)
-{
-
-	char buffer[32];
-
-	snprintf(buffer, sizeof(buffer), "%zu", value);
-	return setvar(e, prefix, var, buffer);
-}
-
-ssize_t
-addvar(char ***e, const char *prefix, const char *var, const char *value)
-{
-	ssize_t len;
-
-	len = setvar(*e, prefix, var, value);
-	if (len != -1)
-		(*e)++;
-	return (ssize_t)len;
-}
-
-ssize_t
-addvard(char ***e, const char *prefix, const char *var, size_t value)
-{
-	char buffer[32];
-
-	snprintf(buffer, sizeof(buffer), "%zu", value);
-	return addvar(e, prefix, var, buffer);
-}
 
 const char *
 hwaddr_ntoa(const void *hwaddr, size_t hwlen, char *buf, size_t buflen)
@@ -110,7 +46,7 @@ hwaddr_ntoa(const void *hwaddr, size_t hwlen, char *buf, size_t buflen)
 	const unsigned char *hp, *ep;
 	char *p;
 
-	if (buf == NULL)
+	if (buf == NULL || hwlen == 0)
 		return NULL;
 
 	if (hwlen * 3 > buflen) {
@@ -169,82 +105,108 @@ hwaddr_aton(uint8_t *buffer, const char *addr)
 	return len;
 }
 
-size_t
-read_hwaddr_aton(uint8_t **data, const char *path)
-{
-	FILE *fp;
-	char *buf;
-	size_t buf_len, len;
-
-	if ((fp = fopen(path, "r")) == NULL)
-		return 0;
-
-	buf = NULL;
-	buf_len = len = 0;
-	*data = NULL;
-	while (getline(&buf, &buf_len, fp) != -1) {
-		if ((len = hwaddr_aton(NULL, buf)) != 0) {
-			if (buf_len >= len)
-				*data = (uint8_t *)buf;
-			else {
-				if ((*data = malloc(len)) == NULL)
-					len = 0;
-			}
-			if (len != 0)
-				(void)hwaddr_aton(*data, buf);
-			if (buf_len < len)
-				free(buf);
-			break;
-		}
-	}
-	fclose(fp);
-	return len;
-}
-
 ssize_t
-recvmsg_realloc(int fd, struct msghdr *msg, int flags)
+readfile(const char *file, void *data, size_t len)
 {
-	struct iovec *iov;
-	ssize_t slen;
-	size_t len;
-	void *n;
+	int fd;
+	ssize_t bytes;
 
-	assert(msg != NULL);
-	assert(msg->msg_iov != NULL && msg->msg_iovlen > 0);
-	assert((flags & (MSG_PEEK | MSG_TRUNC)) == 0);
-
-	/* Assume we are reallocing the last iovec. */
-	iov = &msg->msg_iov[msg->msg_iovlen - 1];
-
-	for (;;) {
-		/* Passing MSG_TRUNC should return the actual size needed. */
-		slen = recvmsg(fd, msg, flags | MSG_PEEK | MSG_TRUNC);
-		if (slen == -1)
-			return -1;
-		if (!(msg->msg_flags & MSG_TRUNC))
-			break;
-
-		len = (size_t)slen;
-
-		/* Some kernels return the size of the receive buffer
-		 * on truncation, not the actual size needed.
-		 * So grow the buffer and try again. */
-		if (iov->iov_len == len)
-			len++;
-		else if (iov->iov_len > len)
-			break;
-		len = roundup(len, IOVEC_BUFSIZ);
-		if ((n = realloc(iov->iov_base, len)) == NULL)
-			return -1;
-		iov->iov_base = n;
-		iov->iov_len = len;
-	}
-
-	slen = recvmsg(fd, msg, flags);
-	if (slen != -1 && msg->msg_flags & MSG_TRUNC) {
-		/* This should not be possible ... */
+	fd = open(file, O_RDONLY);
+	if (fd == -1)
+		return -1;
+	bytes = read(fd, data, len);
+	close(fd);
+	if ((size_t)bytes == len) {
 		errno = ENOBUFS;
 		return -1;
 	}
-	return slen;
+	return bytes;
+}
+
+ssize_t
+writefile(const char *file, mode_t mode, const void *data, size_t len)
+{
+	int fd;
+	ssize_t bytes;
+
+	fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, mode);
+	if (fd == -1)
+		return -1;
+	bytes = write(fd, data, len);
+	close(fd);
+	return bytes;
+}
+
+int
+filemtime(const char *file, time_t *time)
+{
+	struct stat st;
+
+	if (stat(file, &st) == -1)
+		return -1;
+	*time = st.st_mtime;
+	return 0;
+}
+
+/* Handy routine to read very long lines in text files.
+ * This means we read the whole line and avoid any nasty buffer overflows.
+ * We strip leading space and avoid comment lines, making the code that calls
+ * us smaller. */
+char *
+get_line(char ** __restrict buf, ssize_t * __restrict buflen)
+{
+	char *p, *c;
+	bool quoted;
+
+	do {
+		p = *buf;
+		if (*buf == NULL)
+			return NULL;
+		c = memchr(*buf, '\n', (size_t)*buflen);
+		if (c == NULL) {
+			c = memchr(*buf, '\0', (size_t)*buflen);
+			if (c == NULL)
+				return NULL;
+			*buflen = c - *buf;
+			*buf = NULL;
+		} else {
+			*c++ = '\0';
+			*buflen -= c - *buf;
+			*buf = c;
+		}
+		for (; *p == ' ' || *p == '\t'; p++)
+			;
+	} while (*p == '\0' || *p == '\n' || *p == '#' || *p == ';');
+
+	/* Strip embedded comments unless in a quoted string or escaped */
+	quoted = false;
+	for (c = p; *c != '\0'; c++) {
+		if (*c == '\\') {
+			c++; /* escaped */
+			continue;
+		}
+		if (*c == '"')
+			quoted = !quoted;
+		else if (*c == '#' && !quoted) {
+			*c = '\0';
+			break;
+		}
+	}
+	return p;
+}
+
+
+int
+is_root_local(void)
+{
+#ifdef ST_LOCAL
+	struct statvfs vfs;
+
+	if (statvfs("/", &vfs) == -1)
+		return -1;
+	return vfs.f_flag & ST_LOCAL ? 1 : 0;
+#else
+	errno = ENOTSUP;
+	return -1;
+#endif
 }

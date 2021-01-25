@@ -1,6 +1,7 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * dhcpcd - DHCP client daemon
- * Copyright (c) 2006-2018 Roy Marples <roy@marples.name>
+ * Copyright (c) 2006-2020 Roy Marples <roy@marples.name>
  * All rights reserved
 
  * Redistribution and use in source and binary forms, with or without
@@ -30,6 +31,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <net/route.h>
 #include <netinet/in.h>
@@ -55,9 +57,10 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
-#define ELOOP_QUEUE 7
+#define ELOOP_QUEUE	ELOOP_IPV6
 #include "common.h"
 #include "if.h"
 #include "dhcpcd.h"
@@ -66,6 +69,7 @@
 #include "ipv6.h"
 #include "ipv6nd.h"
 #include "logerr.h"
+#include "privsep.h"
 #include "sa.h"
 #include "script.h"
 
@@ -101,7 +105,7 @@
     defined(IFF_NOLINKLOCAL)
 /* Only add the LL address if we have a carrier, so DaD works. */
 #define	CAN_ADD_LLADDR(ifp) \
-    (!((ifp)->options->options & DHCPCD_LINK) || (ifp)->carrier != LINK_DOWN)
+    (!((ifp)->options->options & DHCPCD_LINK) || if_is_link_up((ifp)))
 #ifdef __sun
 /* Although we can add our own LL address, we cannot drop it
  * without unplumbing the if which is a lot of code.
@@ -118,59 +122,45 @@
 #endif
 
 #ifdef IPV6_MANAGETEMPADDR
-static void ipv6_regentempifid(void *);
 static void ipv6_regentempaddr(void *);
-#else
-#define ipv6_regentempifid(a) {}
 #endif
 
 int
 ipv6_init(struct dhcpcd_ctx *ctx)
 {
 
-	if (ctx->sndhdr.msg_iovlen == 1)
+	if (ctx->ra_routers != NULL)
 		return 0;
 
-	if (ctx->ra_routers == NULL) {
-		ctx->ra_routers = malloc(sizeof(*ctx->ra_routers));
-		if (ctx->ra_routers == NULL)
-			return -1;
-	}
+	ctx->ra_routers = malloc(sizeof(*ctx->ra_routers));
+	if (ctx->ra_routers == NULL)
+		return -1;
 	TAILQ_INIT(ctx->ra_routers);
 
-	ctx->sndhdr.msg_namelen = sizeof(struct sockaddr_in6);
-	ctx->sndhdr.msg_iov = ctx->sndiov;
-	ctx->sndhdr.msg_iovlen = 1;
-	ctx->sndhdr.msg_control = ctx->sndbuf;
-	ctx->sndhdr.msg_controllen = sizeof(ctx->sndbuf);
-	ctx->rcvhdr.msg_name = &ctx->from;
-	ctx->rcvhdr.msg_namelen = sizeof(ctx->from);
-	ctx->rcvhdr.msg_iov = ctx->iov;
-	ctx->rcvhdr.msg_iovlen = 1;
-	ctx->rcvhdr.msg_control = ctx->ctlbuf;
-	// controllen is set at recieve
-	//ctx->rcvhdr.msg_controllen = sizeof(ctx->rcvbuf);
-
+#ifndef __sun
 	ctx->nd_fd = -1;
-	ctx->dhcp6_fd = -1;
+#endif
+#ifdef DHCP6
+	ctx->dhcp6_rfd = -1;
+	ctx->dhcp6_wfd = -1;
+#endif
 	return 0;
 }
 
 static ssize_t
 ipv6_readsecret(struct dhcpcd_ctx *ctx)
 {
-	FILE *fp;
 	char line[1024];
 	unsigned char *p;
 	size_t len;
 	uint32_t r;
-	int x;
 
-	if ((ctx->secret_len = read_hwaddr_aton(&ctx->secret, SECRET)) != 0)
+	ctx->secret_len = dhcp_read_hwaddr_aton(ctx, &ctx->secret, SECRET);
+	if (ctx->secret_len != 0)
 		return (ssize_t)ctx->secret_len;
 
 	if (errno != ENOENT)
-		logerr("%s: %s", __func__, SECRET);
+		logerr("%s: cannot read secret", __func__);
 
 	/* Chaining arc4random should be good enough.
 	 * RFC7217 section 5.1 states the key SHOULD be at least 128 bits.
@@ -190,27 +180,18 @@ ipv6_readsecret(struct dhcpcd_ctx *ctx)
 		p += sizeof(r);
 	}
 
-	/* Ensure that only the dhcpcd user can read the secret.
-	 * Write permission is also denied as chaning it would remove
-	 * it's stability. */
-	if ((fp = fopen(SECRET, "w")) == NULL ||
-	    chmod(SECRET, S_IRUSR) == -1)
-		goto eexit;
-	x = fprintf(fp, "%s\n",
-	    hwaddr_ntoa(ctx->secret, ctx->secret_len, line, sizeof(line)));
-	if (fclose(fp) == EOF)
-		x = -1;
-	fp = NULL;
-	if (x > 0)
-		return (ssize_t)ctx->secret_len;
-
-eexit:
-	logerr("%s: %s", __func__, SECRET);
-	if (fp != NULL)
-		fclose(fp);
-	unlink(SECRET);
-	ctx->secret_len = 0;
-	return -1;
+	hwaddr_ntoa(ctx->secret, ctx->secret_len, line, sizeof(line));
+	len = strlen(line);
+	if (len < sizeof(line) - 2) {
+		line[len++] = '\n';
+		line[len] = '\0';
+	}
+	if (dhcp_writefile(ctx, SECRET, S_IRUSR, line, len) == -1) {
+		logerr("%s: cannot write secret", __func__);
+		ctx->secret_len = 0;
+		return -1;
+	}
+	return (ssize_t)ctx->secret_len;
 }
 
 /* http://www.iana.org/assignments/ipv6-interface-ids/ipv6-interface-ids.xhtml
@@ -227,7 +208,7 @@ static const struct reslowhigh {
 	  { 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } }
 };
 
-static int
+static bool
 ipv6_reserved(const struct in6_addr *addr)
 {
 	uint64_t id, low, high;
@@ -237,37 +218,42 @@ ipv6_reserved(const struct in6_addr *addr)
 	id = be64dec(addr->s6_addr + sizeof(id));
 	if (id == 0) /* RFC4291 */
 		return 1;
-	for (i = 0; i < sizeof(reslowhigh) / sizeof(reslowhigh[0]); i++) {
+	for (i = 0; i < __arraycount(reslowhigh); i++) {
 		r = &reslowhigh[i];
 		low = be64dec(r->low);
 		high = be64dec(r->high);
 		if (id >= low && id <= high)
-			return 1;
+			return true;
 	}
-	return 0;
+	return false;
 }
 
 /* RFC7217 */
 static int
-ipv6_makestableprivate1(struct in6_addr *addr,
-    const struct in6_addr *prefix, int prefix_len,
+ipv6_makestableprivate1(struct dhcpcd_ctx *ctx,
+    struct in6_addr *addr, const struct in6_addr *prefix, int prefix_len,
     const unsigned char *netiface, size_t netiface_len,
     const unsigned char *netid, size_t netid_len,
     unsigned short vlanid,
-    uint32_t *dad_counter,
-    const unsigned char *secret, size_t secret_len)
+    uint32_t *dad_counter)
 {
 	unsigned char buf[2048], *p, digest[SHA256_DIGEST_LENGTH];
 	size_t len, l;
-	SHA256_CTX ctx;
+	SHA256_CTX sha_ctx;
 
 	if (prefix_len < 0 || prefix_len > 120) {
 		errno = EINVAL;
 		return -1;
 	}
 
+	if (ctx->secret_len == 0) {
+		if (ipv6_readsecret(ctx) == -1)
+			return -1;
+	}
+
 	l = (size_t)(ROUNDUP8(prefix_len) / NBBY);
-	len = l + netiface_len + netid_len + sizeof(*dad_counter) + secret_len;
+	len = l + netiface_len + netid_len + sizeof(*dad_counter) +
+	    ctx->secret_len;
 	if (vlanid != 0)
 		len += sizeof(vlanid);
 	if (len > sizeof(buf)) {
@@ -292,15 +278,15 @@ ipv6_makestableprivate1(struct in6_addr *addr,
 		}
 		memcpy(p, dad_counter, sizeof(*dad_counter));
 		p += sizeof(*dad_counter);
-		memcpy(p, secret, secret_len);
+		memcpy(p, ctx->secret, ctx->secret_len);
 
 		/* Make an address using the digest of the above.
 		 * RFC7217 Section 5.1 states that we shouldn't use MD5.
 		 * Pity as we use that for HMAC-MD5 which is still deemed OK.
 		 * SHA-256 is recommended */
-		SHA256_Init(&ctx);
-		SHA256_Update(&ctx, buf, len);
-		SHA256_Final(digest, &ctx);
+		SHA256_Init(&sha_ctx);
+		SHA256_Update(&sha_ctx, buf, len);
+		SHA256_Final(digest, &sha_ctx);
 
 		p = addr->s6_addr;
 		memcpy(p, prefix, l);
@@ -330,29 +316,52 @@ ipv6_makestableprivate(struct in6_addr *addr,
 	uint32_t dad;
 	int r;
 
-	if (ifp->ctx->secret_len == 0) {
-		if (ipv6_readsecret(ifp->ctx) == -1)
-			return -1;
-	}
-
 	dad = (uint32_t)*dad_counter;
 
 	/* For our implementation, we shall set the hardware address
 	 * as the interface identifier */
-	r = ipv6_makestableprivate1(addr, prefix, prefix_len,
+	r = ipv6_makestableprivate1(ifp->ctx, addr, prefix, prefix_len,
 	    ifp->hwaddr, ifp->hwlen,
 	    ifp->ssid, ifp->ssid_len,
-	    ifp->vlanid, &dad,
-	    ifp->ctx->secret, ifp->ctx->secret_len);
+	    ifp->vlanid, &dad);
 
 	if (r == 0)
 		*dad_counter = (int)dad;
 	return r;
 }
 
+#ifdef IPV6_AF_TEMPORARY
+static int
+ipv6_maketemporaryaddress(struct in6_addr *addr,
+    const struct in6_addr *prefix, int prefix_len,
+    const struct interface *ifp)
+{
+	struct in6_addr mask;
+	struct interface *ifpn;
+
+	if (ipv6_mask(&mask, prefix_len) == -1)
+		return -1;
+	*addr = *prefix;
+
+again:
+	addr->s6_addr32[2] |= (arc4random() & ~mask.s6_addr32[2]);
+	addr->s6_addr32[3] |= (arc4random() & ~mask.s6_addr32[3]);
+
+	TAILQ_FOREACH(ifpn, ifp->ctx->ifaces, next) {
+		if (ipv6_iffindaddr(ifpn, addr, 0) != NULL)
+			break;
+	}
+	if (ifpn != NULL)
+		goto again;
+	if (ipv6_reserved(addr))
+		goto again;
+	return 0;
+}
+#endif
+
 int
 ipv6_makeaddr(struct in6_addr *addr, struct interface *ifp,
-    const struct in6_addr *prefix, int prefix_len)
+    const struct in6_addr *prefix, int prefix_len, unsigned int flags)
 {
 	const struct ipv6_addr *ap;
 	int dad;
@@ -361,6 +370,13 @@ ipv6_makeaddr(struct in6_addr *addr, struct interface *ifp,
 		errno = EINVAL;
 		return -1;
 	}
+
+#ifdef IPV6_AF_TEMPORARY
+	if (flags & IPV6_AF_TEMPORARY)
+		return ipv6_maketemporaryaddress(addr, prefix, prefix_len, ifp);
+#else
+	UNUSED(flags);
+#endif
 
 	if (ifp->options->options & DHCPCD_SLAACPRIVATE) {
 		dad = 0;
@@ -391,25 +407,14 @@ ipv6_makeaddr(struct in6_addr *addr, struct interface *ifp,
 static int
 ipv6_makeprefix(struct in6_addr *prefix, const struct in6_addr *addr, int len)
 {
-	int bytes, bits;
+	struct in6_addr mask;
+	size_t i;
 
-	if (len < 0 || len > 128) {
-		errno = EINVAL;
+	if (ipv6_mask(&mask, len) == -1)
 		return -1;
-	}
-
-	bytes = len / NBBY;
-	bits = len % NBBY;
-	memcpy(&prefix->s6_addr, &addr->s6_addr, (size_t)bytes);
-	if (bits != 0) {
-		/* Coverify false positive.
-		 * bytelen cannot be 16 if bitlen is non zero */
-		/* coverity[overrun-local] */
-		prefix->s6_addr[bytes] =
-		    (uint8_t)(prefix->s6_addr[bytes] >> (NBBY - bits));
-	}
-	memset((char *)prefix->s6_addr + bytes, 0,
-	    sizeof(prefix->s6_addr) - (size_t)bytes);
+	*prefix = *addr;
+	for (i = 0; i < sizeof(prefix->s6_addr); i++)
+		prefix->s6_addr[i] &= mask.s6_addr[i];
 	return 0;
 }
 
@@ -430,7 +435,7 @@ ipv6_mask(struct in6_addr *mask, int len)
 	bits = len % NBBY;
 	for (i = 0; i < bytes; i++)
 		mask->s6_addr[i] = 0xff;
-	if (bits) {
+	if (bits != 0) {
 		/* Coverify false positive.
 		 * bytelen cannot be 16 if bitlen is non zero */
 		/* coverity[overrun-local] */
@@ -567,7 +572,8 @@ ipv6_checkaddrflags(void *arg)
 	alias = NULL;
 #endif
 	if ((flags = if_addrflags6(ia->iface, &ia->addr, alias)) == -1) {
-		logerr("%s: if_addrflags6", ia->iface->name);
+		if (errno != EEXIST && errno != EADDRNOTAVAIL)
+			logerr("%s: if_addrflags6", __func__);
 		return;
 	}
 
@@ -578,11 +584,8 @@ ipv6_checkaddrflags(void *arg)
 		    &ia->addr, ia->prefix_len, flags, 0);
 	} else {
 		/* Still tentative? Check again in a bit. */
-		struct timespec tv;
-
-		ms_to_ts(&tv, RETRANS_TIMER / 2);
-		eloop_timeout_add_tv(ia->iface->ctx->eloop, &tv,
-		    ipv6_checkaddrflags, ia);
+		eloop_timeout_add_msec(ia->iface->ctx->eloop,
+		    RETRANS_TIMER / 2, ipv6_checkaddrflags, ia);
 	}
 }
 #endif
@@ -591,7 +594,11 @@ static void
 ipv6_deletedaddr(struct ipv6_addr *ia)
 {
 
-#ifdef SMALL
+#ifdef DHCP6
+#ifdef PRIVSEP
+	if (!(ia->iface->ctx->options & DHCPCD_MASTER))
+		ps_inet_closedhcp6(ia);
+#elif defined(SMALL)
 	UNUSED(ia);
 #else
 	/* NOREJECT is set if we delegated exactly the prefix to another
@@ -600,6 +607,9 @@ ipv6_deletedaddr(struct ipv6_addr *ia)
 	 * This should ensure the reject route will be restored. */
 	if (ia->delegating_prefix != NULL)
 		ia->delegating_prefix->flags &= ~IPV6_AF_NOREJECT;
+#endif
+#else
+	UNUSED(ia);
 #endif
 }
 
@@ -625,31 +635,39 @@ ipv6_deleteaddr(struct ipv6_addr *ia)
 			break;
 		}
 	}
+
+#ifdef ND6_ADVERTISE
+	/* Advertise the address if it exists on another interface. */
+	ipv6nd_advertise(ia);
+#endif
 }
 
 static int
 ipv6_addaddr1(struct ipv6_addr *ia, const struct timespec *now)
 {
 	struct interface *ifp;
+	uint32_t pltime, vltime;
+	int loglevel;
+#ifdef ND6_ADVERTISE
+	bool vltime_was_zero = ia->prefix_vltime == 0;
+#endif
+#ifdef __sun
 	struct ipv6_state *state;
 	struct ipv6_addr *ia2;
-	uint32_t pltime, vltime;
-	__printflike(1, 2) void (*logfunc)(const char *, ...);
 
-	/* Ensure no other interface has this address */
-	TAILQ_FOREACH(ifp, ia->iface->ctx->ifaces, next) {
-		if (ifp == ia->iface)
-			continue;
-		state = IPV6_STATE(ifp);
-		if (state == NULL)
-			continue;
-		TAILQ_FOREACH(ia2, &state->addrs, next) {
-			if (IN6_ARE_ADDR_EQUAL(&ia2->addr, &ia->addr)) {
-				ipv6_deleteaddr(ia2);
-				break;
-			}
-		}
+	/* If we re-add then address on Solaris then the prefix
+	 * route will be scrubbed and re-added. Something might
+	 * be using it, so let's avoid it. */
+	if (ia->flags & IPV6_AF_DADCOMPLETED) {
+		logdebugx("%s: IP address %s already exists",
+		    ia->iface->name, ia->saddr);
+#ifdef ND6_ADVERTISE
+		goto advertise;
+#else
+		return 0;
+#endif
 	}
+#endif
 
 	/* Remember the interface of the address. */
 	ifp = ia->iface;
@@ -661,37 +679,43 @@ ipv6_addaddr1(struct ipv6_addr *ia, const struct timespec *now)
 	/* Adjust plftime and vltime based on acquired time */
 	pltime = ia->prefix_pltime;
 	vltime = ia->prefix_vltime;
+
+	if (ifp->options->options & DHCPCD_LASTLEASE_EXTEND) {
+		/* We don't want the kernel to expire the address.
+		 * The saved times will be re-applied to the ia
+		 * before exiting this function. */
+		ia->prefix_vltime = ia->prefix_pltime = ND6_INFINITE_LIFETIME;
+	}
+
 	if (timespecisset(&ia->acquired) &&
 	    (ia->prefix_pltime != ND6_INFINITE_LIFETIME ||
 	    ia->prefix_vltime != ND6_INFINITE_LIFETIME))
 	{
+		uint32_t elapsed;
 		struct timespec n;
 
 		if (now == NULL) {
 			clock_gettime(CLOCK_MONOTONIC, &n);
 			now = &n;
 		}
-		timespecsub(now, &ia->acquired, &n);
+		elapsed = (uint32_t)eloop_timespec_diff(now, &ia->acquired,
+		    NULL);
 		if (ia->prefix_pltime != ND6_INFINITE_LIFETIME) {
-			ia->prefix_pltime -= (uint32_t)n.tv_sec;
-			/* This can happen when confirming a
-			 * deprecated but still valid lease. */
-			if (ia->prefix_pltime > pltime)
+			if (elapsed > ia->prefix_pltime)
 				ia->prefix_pltime = 0;
+			else
+				ia->prefix_pltime -= elapsed;
 		}
 		if (ia->prefix_vltime != ND6_INFINITE_LIFETIME) {
-			ia->prefix_vltime -= (uint32_t)n.tv_sec;
-			/* This should never happen. */
-			if (ia->prefix_vltime > vltime) {
-				logerrx("%s: %s: lifetime overflow",
-				    ifp->name, ia->saddr);
-				ia->prefix_vltime = ia->prefix_pltime = 0;
-			}
+			if (elapsed > ia->prefix_vltime)
+				ia->prefix_vltime = 0;
+			else
+				ia->prefix_vltime -= elapsed;
 		}
 	}
 
-	logfunc = ia->flags & IPV6_AF_NEW ? loginfox : logdebugx;
-	logfunc("%s: adding %saddress %s", ifp->name,
+	loglevel = ia->flags & IPV6_AF_NEW ? LOG_INFO : LOG_DEBUG;
+	logmessage(loglevel, "%s: adding %saddress %s", ifp->name,
 #ifdef IPV6_AF_TEMPORARY
 	    ia->flags & IPV6_AF_TEMPORARY ? "temporary " : "",
 #else
@@ -713,7 +737,6 @@ ipv6_addaddr1(struct ipv6_addr *ia, const struct timespec *now)
 		    " seconds",
 		    ifp->name, ia->prefix_pltime, ia->prefix_vltime);
 
-
 	if (if_address6(RTM_NEWADDR, ia) == -1) {
 		logerr(__func__);
 		/* Restore real pltime and vltime */
@@ -727,9 +750,9 @@ ipv6_addaddr1(struct ipv6_addr *ia, const struct timespec *now)
 	if (ia->flags & IPV6_AF_TEMPORARY &&
 	    ia->prefix_pltime &&
 	    ia->prefix_vltime &&
-	    ip6_use_tempaddr(ifp->name))
+	    ifp->options->options & DHCPCD_SLAACTEMP)
 		eloop_timeout_add_sec(ifp->ctx->eloop,
-		    (time_t)ia->prefix_pltime - REGEN_ADVANCE,
+		    ia->prefix_pltime - REGEN_ADVANCE,
 		    ipv6_regentempaddr, ia);
 #endif
 
@@ -748,11 +771,8 @@ ipv6_addaddr1(struct ipv6_addr *ia, const struct timespec *now)
 	eloop_timeout_delete(ifp->ctx->eloop,
 		ipv6_checkaddrflags, ia);
 	if (!(ia->flags & IPV6_AF_DADCOMPLETED)) {
-		struct timespec tv;
-
-		ms_to_ts(&tv, RETRANS_TIMER / 2);
-		eloop_timeout_add_tv(ifp->ctx->eloop,
-		    &tv, ipv6_checkaddrflags, ia);
+		eloop_timeout_add_msec(ifp->ctx->eloop,
+		    RETRANS_TIMER / 2, ipv6_checkaddrflags, ia);
 	}
 #endif
 
@@ -777,17 +797,26 @@ ipv6_addaddr1(struct ipv6_addr *ia, const struct timespec *now)
 	}
 #endif
 
+#ifdef ND6_ADVERTISE
+#ifdef __sun
+advertise:
+#endif
+	/* Re-advertise the preferred address to be safe. */
+	if (!vltime_was_zero)
+		ipv6nd_advertise(ia);
+#endif
+
 	return 0;
 }
 
 #ifdef ALIAS_ADDR
-/* Find the next logical aliase address we can use. */
+/* Find the next logical alias address we can use. */
 static int
 ipv6_aliasaddr(struct ipv6_addr *ia, struct ipv6_addr **repl)
 {
 	struct ipv6_state *state;
 	struct ipv6_addr *iap;
-	unsigned int unit;
+	unsigned int lun;
 	char alias[IF_NAMESIZE];
 
 	if (ia->alias[0] != '\0')
@@ -806,12 +835,14 @@ ipv6_aliasaddr(struct ipv6_addr *ia, struct ipv6_addr **repl)
 		}
 	}
 
-	unit = 0;
+	lun = 0;
 find_unit:
-	if (unit == 0)
-		strlcpy(alias, ia->iface->name, sizeof(alias));
-	else
-		snprintf(alias, sizeof(alias), "%s:%u", ia->iface->name, unit);
+	if (if_makealias(alias, IF_NAMESIZE, ia->iface->name, lun) >=
+	    IF_NAMESIZE)
+	{
+		errno = ENOMEM;
+		return -1;
+	}
 	TAILQ_FOREACH(iap, &state->addrs, next) {
 		if (iap->alias[0] == '\0')
 			continue;
@@ -827,11 +858,11 @@ find_unit:
 	}
 
 	if (iap != NULL) {
-		if (unit == UINT_MAX) {
+		if (lun == UINT_MAX) {
 			errno = ERANGE;
 			return -1;
 		}
-		unit++;
+		lun++;
 		goto find_unit;
 	}
 
@@ -890,10 +921,14 @@ ipv6_findaddrmatch(const struct ipv6_addr *addr, const struct in6_addr *match,
 struct ipv6_addr *
 ipv6_findaddr(struct dhcpcd_ctx *ctx, const struct in6_addr *addr, unsigned int flags)
 {
-	struct ipv6_addr *dap, *nap;
+	struct ipv6_addr *nap;
+#ifdef DHCP6
+	struct ipv6_addr *dap;
+#endif
 
-	dap = dhcp6_findaddr(ctx, addr, flags);
 	nap = ipv6nd_findaddr(ctx, addr, flags);
+#ifdef DHCP6
+	dap = dhcp6_findaddr(ctx, addr, flags);
 	if (!dap && !nap)
 		return NULL;
 	if (dap && !nap)
@@ -903,72 +938,66 @@ ipv6_findaddr(struct dhcpcd_ctx *ctx, const struct in6_addr *addr, unsigned int 
 	if (nap->iface->metric < dap->iface->metric)
 		return nap;
 	return dap;
+#else
+	return nap;
+#endif
+}
+
+int
+ipv6_doaddr(struct ipv6_addr *ia, struct timespec *now)
+{
+
+	/* A delegated prefix is not an address. */
+	if (ia->flags & IPV6_AF_DELEGATEDPFX)
+		return 0;
+
+	if (ia->prefix_vltime == 0) {
+		if (ia->flags & IPV6_AF_ADDED)
+			ipv6_deleteaddr(ia);
+		eloop_q_timeout_delete(ia->iface->ctx->eloop,
+		    ELOOP_QUEUE_ALL, NULL, ia);
+		if (ia->flags & IPV6_AF_REQUEST) {
+			ia->flags &= ~IPV6_AF_ADDED;
+			return 0;
+		}
+		return -1;
+	}
+
+	if (ia->flags & IPV6_AF_STALE ||
+	    IN6_IS_ADDR_UNSPECIFIED(&ia->addr))
+		return 0;
+
+	if (!timespecisset(now))
+		clock_gettime(CLOCK_MONOTONIC, now);
+	ipv6_addaddr(ia, now);
+	return ia->flags & IPV6_AF_NEW ? 1 : 0;
 }
 
 ssize_t
-ipv6_addaddrs(struct ipv6_addrhead *addrs)
+ipv6_addaddrs(struct ipv6_addrhead *iaddrs)
 {
-	struct ipv6_addr *ap, *apn, *apf;
-	ssize_t i;
 	struct timespec now;
+	struct ipv6_addr *ia, *ian;
+	ssize_t i, r;
 
 	i = 0;
 	timespecclear(&now);
-	TAILQ_FOREACH_SAFE(ap, addrs, next, apn) {
-		/* A delegated prefix is not an address. */
-		if (ap->flags & IPV6_AF_DELEGATEDPFX)
-			continue;
-		if (ap->prefix_vltime == 0) {
-			if (ap->flags & IPV6_AF_ADDED) {
-				ipv6_deleteaddr(ap);
-				i++;
-			}
-			eloop_q_timeout_delete(ap->iface->ctx->eloop,
-			    0, NULL, ap);
-			if (ap->flags & IPV6_AF_REQUEST) {
-				ap->flags &= ~IPV6_AF_ADDED;
-			} else {
-				TAILQ_REMOVE(addrs, ap, next);
-				ipv6_freeaddr(ap);
-			}
-		} else if (!(ap->flags & IPV6_AF_STALE) &&
-		    !IN6_IS_ADDR_UNSPECIFIED(&ap->addr))
-		{
-			apf = ipv6_findaddr(ap->iface->ctx,
-			    &ap->addr, IPV6_AF_ADDED);
-			if (apf && apf->iface != ap->iface) {
-				if (apf->iface->metric <= ap->iface->metric) {
-					loginfox("%s: preferring %s on %s",
-					    ap->iface->name,
-					    ap->saddr,
-					    apf->iface->name);
-					continue;
-				}
-				loginfox("%s: preferring %s on %s",
-				    apf->iface->name,
-				    ap->saddr,
-				    ap->iface->name);
-				if (if_address6(RTM_DELADDR, apf) == -1 &&
-				    errno != EADDRNOTAVAIL && errno != ENXIO)
-					logerr(__func__);
-				apf->flags &=
-				    ~(IPV6_AF_ADDED | IPV6_AF_DADCOMPLETED);
-			} else if (apf)
-				apf->flags &= ~IPV6_AF_ADDED;
-			if (ap->flags & IPV6_AF_NEW)
-				i++;
-			if (!timespecisset(&now))
-				clock_gettime(CLOCK_MONOTONIC, &now);
-			ipv6_addaddr(ap, &now);
+	TAILQ_FOREACH_SAFE(ia, iaddrs, next, ian) {
+		r = ipv6_doaddr(ia, &now);
+		if (r != 0)
+			i++;
+		if (r == -1) {
+			TAILQ_REMOVE(iaddrs, ia, next);
+			ipv6_freeaddr(ia);
 		}
 	}
-
 	return i;
 }
 
 void
 ipv6_freeaddr(struct ipv6_addr *ia)
 {
+	struct eloop *eloop = ia->iface->ctx->eloop;
 #ifndef SMALL
 	struct ipv6_addr *iad;
 
@@ -984,10 +1013,11 @@ ipv6_freeaddr(struct ipv6_addr *ia)
 
 	if (ia->dhcp6_fd != -1) {
 		close(ia->dhcp6_fd);
-		eloop_event_delete(ia->iface->ctx->eloop, ia->dhcp6_fd);
+		eloop_event_delete(eloop, ia->dhcp6_fd);
 	}
 
-	eloop_q_timeout_delete(ia->iface->ctx->eloop, 0, NULL, ia);
+	eloop_q_timeout_delete(eloop, ELOOP_QUEUE_ALL, NULL, ia);
+	free(ia->na);
 	free(ia);
 }
 
@@ -1060,13 +1090,48 @@ ipv6_getstate(struct interface *ifp)
 		}
 		TAILQ_INIT(&state->addrs);
 		TAILQ_INIT(&state->ll_callbacks);
-
-		/* Regenerate new ids */
-		if (ifp->options &&
-		    ip6_use_tempaddr(ifp->name))
-			ipv6_regentempifid(ifp);
 	}
 	return state;
+}
+
+struct ipv6_addr *
+ipv6_anyglobal(struct interface *sifp)
+{
+	struct interface *ifp;
+	struct ipv6_state *state;
+	struct ipv6_addr *ia;
+	bool forwarding;
+
+	/* BSD forwarding is either on or off.
+	 * Linux forwarding is technically the same as it's
+	 * configured by the "all" interface.
+	 * Per interface only affects IsRouter of NA messages. */
+#if defined(PRIVSEP) && (defined(HAVE_PLEDGE) || defined(__linux__))
+	if (IN_PRIVSEP(sifp->ctx))
+		forwarding = ps_root_ip6forwarding(sifp->ctx, NULL) != 0;
+	else
+#endif
+		forwarding = ip6_forwarding(NULL) != 0;
+
+	TAILQ_FOREACH(ifp, sifp->ctx->ifaces, next) {
+		if (ifp != sifp && !forwarding)
+			continue;
+
+		state = IPV6_STATE(ifp);
+		if (state == NULL)
+			continue;
+
+		TAILQ_FOREACH(ia, &state->addrs, next) {
+			if (IN6_IS_ADDR_LINKLOCAL(&ia->addr))
+				continue;
+			/* Let's be optimistic.
+			 * Any decent OS won't forward or accept traffic
+			 * from/to tentative or detached addresses. */
+			if (!(ia->addr_flags & IN6_IFF_DUPLICATED))
+				return ia;
+		}
+	}
+	return NULL;
 }
 
 void
@@ -1078,6 +1143,22 @@ ipv6_handleifa(struct dhcpcd_ctx *ctx,
 	struct ipv6_state *state;
 	struct ipv6_addr *ia;
 	struct ll_callback *cb;
+	bool anyglobal;
+
+#ifdef __sun
+	struct sockaddr_in6 subnet;
+
+	/* Solaris on-link route is an unspecified address! */
+	if (IN6_IS_ADDR_UNSPECIFIED(addr)) {
+		if (if_getsubnet(ctx, ifname, AF_INET6,
+		    &subnet, sizeof(subnet)) == -1)
+		{
+			logerr(__func__);
+			return;
+		}
+		addr = &subnet.sin6_addr;
+	}
+#endif
 
 #if 0
 	char dbuf[INET6_ADDRSTRLEN];
@@ -1085,8 +1166,8 @@ ipv6_handleifa(struct dhcpcd_ctx *ctx,
 
 	dbp = inet_ntop(AF_INET6, &addr->s6_addr,
 	    dbuf, INET6_ADDRSTRLEN);
-	loginfox("%s: cmd %d addr %s",
-	    ifname, cmd, dbp);
+	loginfox("%s: cmd %d addr %s addrflags %d",
+	    ifname, cmd, dbp, addrflags);
 #endif
 
 	if (ifs == NULL)
@@ -1097,6 +1178,7 @@ ipv6_handleifa(struct dhcpcd_ctx *ctx,
 		return;
 	if ((state = ipv6_getstate(ifp)) == NULL)
 		return;
+	anyglobal = ipv6_anyglobal(ifp) != NULL;
 
 	TAILQ_FOREACH(ia, &state->addrs, next) {
 		if (IN6_ARE_ADDR_EQUAL(&ia->addr, addr))
@@ -1107,6 +1189,11 @@ ipv6_handleifa(struct dhcpcd_ctx *ctx,
 	case RTM_DELADDR:
 		if (ia != NULL) {
 			TAILQ_REMOVE(&state->addrs, ia, next);
+#ifdef ND6_ADVERTISE
+			/* Advertise the address if it exists on
+			 * another interface. */
+			ipv6nd_advertise(ia);
+#endif
 			/* We'll free it at the end of the function. */
 		}
 		break;
@@ -1151,21 +1238,15 @@ ipv6_handleifa(struct dhcpcd_ctx *ctx,
 		if (IN6_IS_ADDR_LINKLOCAL(&ia->addr) || ia->dadcallback) {
 #ifdef IPV6_POLLADDRFLAG
 			if (ia->addr_flags & IN6_IFF_TENTATIVE) {
-				struct timespec tv;
-
-				ms_to_ts(&tv, RETRANS_TIMER / 2);
-				eloop_timeout_add_tv(
+				eloop_timeout_add_msec(
 				    ia->iface->ctx->eloop,
-				    &tv, ipv6_checkaddrflags, ia);
+				    RETRANS_TIMER / 2, ipv6_checkaddrflags, ia);
 				break;
 			}
 #endif
 
-			if (ia->dadcallback) {
+			if (ia->dadcallback)
 				ia->dadcallback(ia);
-				if (ctx->options & DHCPCD_FORKED)
-					goto out;
-			}
 
 			if (IN6_IS_ADDR_LINKLOCAL(&ia->addr) &&
 			    !(ia->addr_flags & IN6_IFF_NOTUSEABLE))
@@ -1180,8 +1261,6 @@ ipv6_handleifa(struct dhcpcd_ctx *ctx,
 					    cb, next);
 					cb->callback(cb->arg);
 					free(cb);
-					if (ctx->options & DHCPCD_FORKED)
-						goto out;
 				}
 			}
 		}
@@ -1191,15 +1270,28 @@ ipv6_handleifa(struct dhcpcd_ctx *ctx,
 	if (ia == NULL)
 		return;
 
+	ctx->options &= ~DHCPCD_RTBUILD;
 	ipv6nd_handleifa(cmd, ia, pid);
 #ifdef DHCP6
 	dhcp6_handleifa(cmd, ia, pid);
 #endif
 
-out:
 	/* Done with the ia now, so free it. */
 	if (cmd == RTM_DELADDR)
 		ipv6_freeaddr(ia);
+	else if (!(ia->addr_flags & IN6_IFF_NOTUSEABLE))
+		ia->flags |= IPV6_AF_DADCOMPLETED;
+
+	/* If we've not already called rt_build via the IPv6ND
+	 * or DHCP6 handlers and the existance of any useable
+	 * global address on the interface has changed,
+	 * call rt_build to add/remove the default route. */
+	if (ifp->active &&
+	    ((ifp->options != NULL && ifp->options->options & DHCPCD_IPV6) ||
+	     (ifp->options == NULL && ctx->options & DHCPCD_IPV6)) &&
+	    !(ctx->options & DHCPCD_RTBUILD) &&
+	    (ipv6_anyglobal(ifp) != NULL) != anyglobal)
+		rt_build(ctx, AF_INET6);
 }
 
 int
@@ -1208,8 +1300,10 @@ ipv6_hasaddr(const struct interface *ifp)
 
 	if (ipv6nd_iffindaddr(ifp, NULL, 0) != NULL)
 		return 1;
+#ifdef DHCP6
 	if (dhcp6_iffindaddr(ifp, NULL, 0) != NULL)
 		return 1;
+#endif
 	return 0;
 }
 
@@ -1322,9 +1416,12 @@ ipv6_addlinklocal(struct interface *ifp)
 	struct ipv6_addr *ap, *ap2;
 	int dadcounter;
 
+	if (!(ifp->options->options & DHCPCD_CONFIGURE))
+		return 0;
+
 	/* Check sanity before malloc */
 	if (!(ifp->options->options & DHCPCD_SLAACPRIVATE)) {
-		switch (ifp->family) {
+		switch (ifp->hwtype) {
 		case ARPHRD_ETHER:
 			/* Check for a valid hardware address */
 			if (ifp->hwlen != 6 && ifp->hwlen != 8) {
@@ -1364,7 +1461,7 @@ nextslaacprivate:
 		ap->dadcounter = dadcounter;
 	} else {
 		memcpy(ap->addr.s6_addr, ap->prefix.s6_addr, 8);
-		switch (ifp->family) {
+		switch (ifp->hwtype) {
 		case ARPHRD_ETHER:
 			if (ifp->hwlen == 6) {
 				ap->addr.s6_addr[ 8] = ifp->hwaddr[0];
@@ -1437,12 +1534,9 @@ ipv6_tryaddlinklocal(struct interface *ifp)
 	if (ia != NULL) {
 #ifdef IPV6_POLLADDRFLAG
 		if (ia->addr_flags & IN6_IFF_TENTATIVE) {
-			struct timespec tv;
-
-			ms_to_ts(&tv, RETRANS_TIMER / 2);
-			eloop_timeout_add_tv(
+			eloop_timeout_add_msec(
 			    ia->iface->ctx->eloop,
-			    &tv, ipv6_checkaddrflags, ia);
+			    RETRANS_TIMER / 2, ipv6_checkaddrflags, ia);
 		}
 #endif
 		return 0;
@@ -1453,22 +1547,72 @@ ipv6_tryaddlinklocal(struct interface *ifp)
 	return ipv6_addlinklocal(ifp);
 }
 
+void
+ipv6_setscope(struct sockaddr_in6 *sin, unsigned int ifindex)
+{
+
+#ifdef __KAME__
+	/* KAME based systems want to store the scope inside the sin6_addr
+	 * for link local addresses */
+	if (IN6_IS_ADDR_LINKLOCAL(&sin->sin6_addr)) {
+		uint16_t scope = htons((uint16_t)ifindex);
+		memcpy(&sin->sin6_addr.s6_addr[2], &scope,
+		    sizeof(scope));
+	}
+	sin->sin6_scope_id = 0;
+#else
+	if (IN6_IS_ADDR_LINKLOCAL(&sin->sin6_addr))
+		sin->sin6_scope_id = ifindex;
+	else
+		sin->sin6_scope_id = 0;
+#endif
+}
+
+unsigned int
+ipv6_getscope(const struct sockaddr_in6 *sin)
+{
+#ifdef __KAME__
+	uint16_t scope;
+#endif
+
+	if (!IN6_IS_ADDR_LINKLOCAL(&sin->sin6_addr))
+		return 0;
+#ifdef __KAME__
+	memcpy(&scope, &sin->sin6_addr.s6_addr[2], sizeof(scope));
+	return (unsigned int)ntohs(scope);
+#else
+	return (unsigned int)sin->sin6_scope_id;
+#endif
+}
+
 struct ipv6_addr *
 ipv6_newaddr(struct interface *ifp, const struct in6_addr *addr,
     uint8_t prefix_len, unsigned int flags)
 {
-	struct ipv6_addr *ia;
+	struct ipv6_addr *ia, *iaf;
 	char buf[INET6_ADDRSTRLEN];
 	const char *cbp;
 	bool tempaddr;
 	int addr_flags;
 
+#ifdef IPV6_AF_TEMPORARY
+	tempaddr = flags & IPV6_AF_TEMPORARY;
+#else
+	tempaddr = false;
+#endif
+
 	/* If adding a new DHCP / RA derived address, check current flags
 	 * from an existing address. */
-	ia = ipv6_iffindaddr(ifp, addr, 0);
-	if (ia != NULL)
-		addr_flags = ia->addr_flags;
+	if (tempaddr)
+		iaf = NULL;
+	else if (flags & IPV6_AF_AUTOCONF)
+		iaf = ipv6nd_iffindprefix(ifp, addr, prefix_len);
 	else
+		iaf = ipv6_iffindaddr(ifp, addr, 0);
+	if (iaf != NULL) {
+		addr_flags = iaf->addr_flags;
+		flags |= IPV6_AF_ADDED;
+	} else
 		addr_flags = IN6_IFF_TENTATIVE;
 
 	ia = calloc(1, sizeof(*ia));
@@ -1476,34 +1620,46 @@ ipv6_newaddr(struct interface *ifp, const struct in6_addr *addr,
 		goto err;
 
 	ia->iface = ifp;
-	ia->flags = IPV6_AF_NEW | flags;
 	ia->addr_flags = addr_flags;
+	ia->flags = IPV6_AF_NEW | flags;
+	if (!(ia->addr_flags & IN6_IFF_NOTUSEABLE))
+		ia->flags |= IPV6_AF_DADCOMPLETED;
 	ia->prefix_len = prefix_len;
 	ia->dhcp6_fd = -1;
 
-#ifdef IPV6_AF_TEMPORARY
-	tempaddr = ia->flags & IPV6_AF_TEMPORARY;
-#else
-	tempaddr = false;
+#ifndef SMALL
+	TAILQ_INIT(&ia->pd_pfxs);
 #endif
 
-	if (ia->flags & IPV6_AF_AUTOCONF && !tempaddr) {
+	if (prefix_len == 128)
+		goto makepfx;
+	else if (ia->flags & IPV6_AF_AUTOCONF) {
 		ia->prefix = *addr;
-		ia->dadcounter = ipv6_makeaddr(&ia->addr, ifp,
-		                               &ia->prefix,
-					       ia->prefix_len);
-		if (ia->dadcounter == -1)
-			goto err;
+		if (iaf != NULL)
+			memcpy(&ia->addr, &iaf->addr, sizeof(ia->addr));
+		else {
+			ia->dadcounter = ipv6_makeaddr(&ia->addr, ifp,
+			                               &ia->prefix,
+						       ia->prefix_len,
+						       ia->flags);
+			if (ia->dadcounter == -1)
+				goto err;
+		}
 	} else if (ia->flags & IPV6_AF_RAPFX) {
 		ia->prefix = *addr;
+#ifdef __sun
+		ia->addr = *addr;
+		cbp = inet_ntop(AF_INET6, &ia->addr, buf, sizeof(buf));
+		goto paddr;
+#else
 		return ia;
-	} else if (ia->flags & (IPV6_AF_REQUEST | IPV6_AF_DELEGATEDPFX) &&
-	           prefix_len != 128)
-	{
+#endif
+	} else if (ia->flags & (IPV6_AF_REQUEST | IPV6_AF_DELEGATEDPFX)) {
 		ia->prefix = *addr;
 		cbp = inet_ntop(AF_INET6, &ia->prefix, buf, sizeof(buf));
 		goto paddr;
 	} else {
+makepfx:
 		ia->addr = *addr;
 		if (ipv6_makeprefix(&ia->prefix,
 		                    &ia->addr, ia->prefix_len) == -1)
@@ -1532,7 +1688,7 @@ ipv6_staticdadcallback(void *arg)
 
 	wascompleted = (ia->flags & IPV6_AF_DADCOMPLETED);
 	ia->flags |= IPV6_AF_DADCOMPLETED;
-	if (ia->flags & IPV6_AF_DUPLICATED)
+	if (ia->addr_flags & IN6_IFF_DUPLICATED)
 		logwarnx("%s: DAD detected %s", ia->iface->name,
 		    ia->saddr);
 	else if (!wascompleted) {
@@ -1562,23 +1718,17 @@ ipv6_staticdadcallback(void *arg)
 }
 
 ssize_t
-ipv6_env(char **env, const char *prefix, const struct interface *ifp)
+ipv6_env(FILE *fp, const char *prefix, const struct interface *ifp)
 {
-	char **ep;
-	ssize_t n;
 	struct ipv6_addr *ia;
 
-	ep = env;
-	n = 0;
 	ia = ipv6_iffindaddr(UNCONST(ifp), &ifp->options->req_addr6,
 	    IN6_IFF_NOTUSEABLE);
-	if (ia) {
-		if (env)
-			addvar(&ep, prefix, "ip6_address", ia->saddr);
-		n++;
-	}
-
-	return n;
+	if (ia == NULL)
+		return 0;
+	if (efprintf(fp, "%s_ip6_address=%s", prefix, ia->saddr) == -1)
+		return -1;
+	return 1;
 }
 
 int
@@ -1634,7 +1784,6 @@ ipv6_startstatic(struct interface *ifp)
 	ia->prefix_pltime = ND6_INFINITE_LIFETIME;
 	ia->dadcallback = ipv6_staticdadcallback;
 	ipv6_addaddr(ia, NULL);
-	if_initrt(ifp->ctx, AF_INET6);
 	rt_build(ifp->ctx, AF_INET6);
 	if (run_script)
 		script_runreason(ifp, "STATIC6");
@@ -1670,14 +1819,6 @@ ipv6_start(struct interface *ifp)
 	if (ipv6_tryaddlinklocal(ifp) == -1)
 		return -1;
 
-	if (IPV6_CSTATE(ifp)) {
-		/* Regenerate new ids */
-		if (ip6_use_tempaddr(ifp->name))
-			ipv6_regentempifid(ifp);
-	}
-
-	/* Load existing routes */
-	if_initrt(ifp->ctx, AF_INET6);
 	return 0;
 }
 
@@ -1701,10 +1842,8 @@ ipv6_freedrop(struct interface *ifp, int drop)
 
 	ipv6_freedrop_addrs(&state->addrs, drop ? 2 : 0, NULL);
 	if (drop) {
-		if (ifp->ctx->ra_routers != NULL) {
-			if_initrt(ifp->ctx, AF_INET6);
+		if (ifp->ctx->ra_routers != NULL)
 			rt_build(ifp->ctx, AF_INET6);
-		}
 	} else {
 		/* Because we need to cache the addresses we don't control,
 		 * we only free the state on when NOT dropping addresses. */
@@ -1745,23 +1884,20 @@ ipv6_handleifa_addrs(int cmd,
 				    ia->iface->name, pid, ia->saddr);
 				ia->flags &= ~IPV6_AF_ADDED;
 			}
+			ipv6_deletedaddr(ia);
 			if (ia->flags & IPV6_AF_DELEGATED) {
 				TAILQ_REMOVE(addrs, ia, next);
-				ipv6_deletedaddr(ia);
 				ipv6_freeaddr(ia);
 			}
 			break;
 		case RTM_NEWADDR:
+			ia->addr_flags = addr->addr_flags;
 			/* Safety - ignore tentative announcements */
-			if (addr->addr_flags &
+			if (ia->addr_flags &
 			    (IN6_IFF_DETACHED | IN6_IFF_TENTATIVE))
 				break;
 			if ((ia->flags & IPV6_AF_DADCOMPLETED) == 0) {
 				found++;
-				if (addr->addr_flags & IN6_IFF_DUPLICATED)
-					ia->flags |= IPV6_AF_DUPLICATED;
-				else
-					ia->flags &= ~IPV6_AF_DUPLICATED;
 				if (ia->dadcallback)
 					ia->dadcallback(ia);
 				/* We need to set this here in-case the
@@ -1776,107 +1912,26 @@ ipv6_handleifa_addrs(int cmd,
 }
 
 #ifdef IPV6_MANAGETEMPADDR
-static const struct ipv6_addr *
-ipv6_findaddrid(struct dhcpcd_ctx *ctx, uint8_t *addr)
-{
-	const struct interface *ifp;
-	const struct ipv6_state *state;
-	const struct ipv6_addr *ia;
-
-	TAILQ_FOREACH(ifp, ctx->ifaces, next) {
-		if ((state = IPV6_CSTATE(ifp))) {
-			TAILQ_FOREACH(ia, &state->addrs, next) {
-				if (memcmp(&ia->addr.s6_addr[8], addr, 8) == 0)
-					return ia;
-			}
-		}
-	}
-	return NULL;
-}
-
-static const uint8_t nullid[8];
-static const uint8_t anycastid[8] = {
-    0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80 };
-static const uint8_t isatapid[4] = { 0x00, 0x00, 0x5e, 0xfe };
-
 static void
-ipv6_regen_desync(struct interface *ifp, int force)
+ipv6_regen_desync(struct interface *ifp, bool force)
 {
 	struct ipv6_state *state;
-	time_t max;
+	unsigned int max;
 
 	state = IPV6_STATE(ifp);
 
 	/* RFC4941 Section 5 states that DESYNC_FACTOR must never be
 	 * greater than TEMP_VALID_LIFETIME - REGEN_ADVANCE.
-	 * I believe this is an error and it should be never be greateter than
+	 * I believe this is an error and it should be never be greater than
 	 * TEMP_PREFERRED_LIFETIME - REGEN_ADVANCE. */
-	max = ip6_temp_preferred_lifetime(ifp->name) - REGEN_ADVANCE;
+	max = TEMP_PREFERRED_LIFETIME - REGEN_ADVANCE;
 	if (state->desync_factor && !force && state->desync_factor < max)
 		return;
 	if (state->desync_factor == 0)
 		state->desync_factor =
-		    (time_t)arc4random_uniform(MIN(MAX_DESYNC_FACTOR,
-		    (uint32_t)max));
-	max = ip6_temp_preferred_lifetime(ifp->name) -
-	    state->desync_factor - REGEN_ADVANCE;
-	eloop_timeout_add_sec(ifp->ctx->eloop, max, ipv6_regentempifid, ifp);
-}
-
-void
-ipv6_gentempifid(struct interface *ifp)
-{
-	struct ipv6_state *state;
-	MD5_CTX md5;
-	uint8_t seed[16], digest[16];
-	int retry;
-
-	if ((state = IPV6_STATE(ifp)) == NULL)
-		return;
-
-	retry = 0;
-	if (memcmp(nullid, state->randomseed0, sizeof(nullid)) == 0) {
-		uint32_t r;
-
-		r = arc4random();
-		memcpy(seed, &r, sizeof(r));
-		r = arc4random();
-		memcpy(seed + sizeof(r), &r, sizeof(r));
-	} else
-		memcpy(seed, state->randomseed0, sizeof(state->randomseed0));
-
-	memcpy(seed + sizeof(state->randomseed0),
-	    state->randomseed1, sizeof(state->randomseed1));
-
-again:
-	MD5Init(&md5);
-	MD5Update(&md5, seed, sizeof(seed));
-	MD5Final(digest, &md5);
-
-	/* RFC4941 Section 3.2.1.1
-	 * Take the left-most 64bits and set bit 6 to zero */
-	memcpy(state->randomid, digest, sizeof(state->randomid));
-	state->randomid[0] = (uint8_t)(state->randomid[0] & ~EUI64_UBIT);
-
-	/* RFC4941 Section 3.2.1.4
-	 * Reject reserved or existing id's */
-	if (memcmp(nullid, state->randomid, sizeof(nullid)) == 0 ||
-	    (memcmp(anycastid, state->randomid, 7) == 0 &&
-	    (anycastid[7] & state->randomid[7]) == anycastid[7]) ||
-	    memcmp(isatapid, state->randomid, sizeof(isatapid)) == 0 ||
-	    ipv6_findaddrid(ifp->ctx, state->randomid))
-	{
-		if (++retry < GEN_TEMPID_RETRY_MAX) {
-			memcpy(seed, digest + 8, 8);
-			goto again;
-		}
-		memset(state->randomid, 0, sizeof(state->randomid));
-	}
-
-	/* RFC4941 Section 3.2.1.6
-	 * Save the right-most 64bits of the digest */
-	memcpy(state->randomseed0, digest + 8,
-	    sizeof(state->randomseed0));
+		    arc4random_uniform(MIN(MAX_DESYNC_FACTOR, max));
+	max = TEMP_PREFERRED_LIFETIME - state->desync_factor - REGEN_ADVANCE;
+	eloop_timeout_add_sec(ifp->ctx->eloop, max, ipv6_regentempaddrs, ifp);
 }
 
 /* RFC4941 Section 3.3.7 */
@@ -1885,7 +1940,7 @@ ipv6_tempdadcallback(void *arg)
 {
 	struct ipv6_addr *ia = arg;
 
-	if (ia->flags & IPV6_AF_DUPLICATED) {
+	if (ia->addr_flags & IN6_IFF_DUPLICATED) {
 		struct ipv6_addr *ia1;
 		struct timespec tv;
 
@@ -1909,76 +1964,25 @@ struct ipv6_addr *
 ipv6_createtempaddr(struct ipv6_addr *ia0, const struct timespec *now)
 {
 	struct ipv6_state *state;
-	const struct ipv6_state *cstate;
-	int genid;
-	struct in6_addr addr, mask;
-	uint32_t randid[2];
-	const struct interface *ifp;
-	const struct ipv6_addr *ap;
+	struct interface *ifp = ia0->iface;
 	struct ipv6_addr *ia;
-	uint32_t i, trylimit;
 
-	trylimit = TEMP_IDGEN_RETRIES;
-	state = IPV6_STATE(ia0->iface);
-	genid = 0;
-
-	addr = ia0->addr;
-	ipv6_mask(&mask, ia0->prefix_len);
-	/* clear the old ifid */
-	for (i = 0; i < 4; i++)
-		addr.s6_addr32[i] &= mask.s6_addr32[i];
-
-again:
-	if (memcmp(state->randomid, nullid, sizeof(nullid)) == 0)
-		genid = 1;
-	if (genid) {
-		memcpy(state->randomseed1, &ia0->addr.s6_addr[8],
-		    sizeof(state->randomseed1));
-		ipv6_gentempifid(ia0->iface);
-		if (memcmp(state->randomid, nullid, sizeof(nullid)) == 0) {
-			errno = EFAULT;
-			return NULL;
-		}
-	}
-	memcpy(&randid[0], state->randomid, sizeof(randid[0]));
-	memcpy(&randid[1], state->randomid + sizeof(randid[1]),
-	    sizeof(randid[2]));
-	addr.s6_addr32[2] |= randid[0] & ~mask.s6_addr32[2];
-	addr.s6_addr32[3] |= randid[1] & ~mask.s6_addr32[3];
-
-	/* Ensure we don't already have it */
-	TAILQ_FOREACH(ifp, ia0->iface->ctx->ifaces, next) {
-		cstate = IPV6_CSTATE(ifp);
-		if (cstate) {
-			TAILQ_FOREACH(ap, &cstate->addrs, next) {
-				if (IN6_ARE_ADDR_EQUAL(&ap->addr, &addr)) {
-					if (--trylimit == 0) {
-						errno = EEXIST;
-						return NULL;
-					}
-					genid = 1;
-					goto again;
-				}
-			}
-		}
-	}
-
-	ia = ipv6_newaddr(ia0->iface, &addr, ia0->prefix_len,
+	ia = ipv6_newaddr(ifp, &ia0->prefix, ia0->prefix_len,
 	    IPV6_AF_AUTOCONF | IPV6_AF_TEMPORARY);
-	/* Must be made tentative, for our DaD to work */
-	ia->addr_flags = IN6_IFF_TENTATIVE;
+	if (ia == NULL)
+		return NULL;
+
 	ia->dadcallback = ipv6_tempdadcallback;
 	ia->created = ia->acquired = now ? *now : ia0->acquired;
 
 	/* Ensure desync is still valid */
-	ipv6_regen_desync(ia->iface, 0);
+	ipv6_regen_desync(ifp, false);
 
 	/* RFC4941 Section 3.3.4 */
-	i = (uint32_t)(ip6_temp_preferred_lifetime(ia0->iface->name) -
-	    state->desync_factor);
-	ia->prefix_pltime = MIN(ia0->prefix_pltime, i);
-	i = (uint32_t)ip6_temp_valid_lifetime(ia0->iface->name);
-	ia->prefix_vltime = MIN(ia0->prefix_vltime, i);
+	state = IPV6_STATE(ia->iface);
+	ia->prefix_pltime = MIN(ia0->prefix_pltime,
+	    TEMP_PREFERRED_LIFETIME - state->desync_factor);
+	ia->prefix_vltime = MIN(ia0->prefix_vltime, TEMP_VALID_LIFETIME);
 	if (ia->prefix_pltime <= REGEN_ADVANCE ||
 	    ia->prefix_pltime > ia0->prefix_vltime)
 	{
@@ -2004,7 +2008,7 @@ ipv6_settemptime(struct ipv6_addr *ia, int flags)
 		    ap->prefix_pltime &&
 		    IN6_ARE_ADDR_EQUAL(&ia->prefix, &ap->prefix))
 		{
-			time_t max, ext;
+			unsigned int max, ext;
 
 			if (flags == 0) {
 				if (ap->prefix_pltime -
@@ -2028,15 +2032,16 @@ ipv6_settemptime(struct ipv6_addr *ia, int flags)
 			}
 
 			/* Ensure desync is still valid */
-			ipv6_regen_desync(ap->iface, 0);
+			ipv6_regen_desync(ap->iface, false);
 
 			/* RFC4941 Section 3.3.2
 			 * Extend temporary times, but ensure that they
 			 * never last beyond the system limit. */
-			ext = ia->acquired.tv_sec + (time_t)ia->prefix_pltime;
-			max = ap->created.tv_sec +
-			    ip6_temp_preferred_lifetime(ap->iface->name) -
-			    state->desync_factor;
+			ext = (unsigned int)ia->acquired.tv_sec
+			    + ia->prefix_pltime;
+			max = (unsigned int)(ap->created.tv_sec +
+			    TEMP_PREFERRED_LIFETIME -
+			    state->desync_factor);
 			if (ext < max)
 				ap->prefix_pltime = ia->prefix_pltime;
 			else
@@ -2044,9 +2049,10 @@ ipv6_settemptime(struct ipv6_addr *ia, int flags)
 				    (uint32_t)(max - ia->acquired.tv_sec);
 
 valid:
-			ext = ia->acquired.tv_sec + (time_t)ia->prefix_vltime;
-			max = ap->created.tv_sec +
-			    ip6_temp_valid_lifetime(ap->iface->name);
+			ext = (unsigned int)ia->acquired.tv_sec +
+			    ia->prefix_vltime;
+			max = (unsigned int)(ap->created.tv_sec +
+			    TEMP_VALID_LIFETIME);
 			if (ext < max)
 				ap->prefix_vltime = ia->prefix_vltime;
 			else
@@ -2084,31 +2090,60 @@ ipv6_addtempaddrs(struct interface *ifp, const struct timespec *now)
 }
 
 static void
-ipv6_regentempaddr(void *arg)
+ipv6_regentempaddr0(struct ipv6_addr *ia, struct timespec *tv)
 {
-	struct ipv6_addr *ia = arg, *ia1;
-	struct timespec tv;
+	struct ipv6_addr *ia1;
 
 	logdebugx("%s: regen temp addr %s", ia->iface->name, ia->saddr);
-	clock_gettime(CLOCK_MONOTONIC, &tv);
-	ia1 = ipv6_createtempaddr(ia, &tv);
+	ia1 = ipv6_createtempaddr(ia, tv);
 	if (ia1)
-		ipv6_addaddr(ia1, &tv);
+		ipv6_addaddr(ia1, tv);
 	else
 		logerr(__func__);
 }
 
 static void
-ipv6_regentempifid(void *arg)
+ipv6_regentempaddr(void *arg)
+{
+	struct timespec tv;
+
+	clock_gettime(CLOCK_MONOTONIC, &tv);
+	ipv6_regentempaddr0(arg, &tv);
+}
+
+void
+ipv6_regentempaddrs(void *arg)
 {
 	struct interface *ifp = arg;
+	struct timespec tv;
 	struct ipv6_state *state;
+	struct ipv6_addr *ia;
 
 	state = IPV6_STATE(ifp);
-	if (memcmp(state->randomid, nullid, sizeof(state->randomid)))
-		ipv6_gentempifid(ifp);
+	if (state == NULL)
+		return;
 
-	ipv6_regen_desync(ifp, 1);
+	ipv6_regen_desync(ifp, true);
+
+	clock_gettime(CLOCK_MONOTONIC, &tv);
+
+	/* Mark addresses for regen so we don't infinite loop. */
+	TAILQ_FOREACH(ia, &state->addrs, next) {
+		if (ia->flags & IPV6_AF_TEMPORARY &&
+		    ia->flags & IPV6_AF_ADDED &&
+		    !(ia->flags & IPV6_AF_STALE))
+			ia->flags |= IPV6_AF_REGEN;
+		else
+			ia->flags &= ~IPV6_AF_REGEN;
+	}
+
+	/* Now regen temp addrs */
+	TAILQ_FOREACH(ia, &state->addrs, next) {
+		if (ia->flags & IPV6_AF_REGEN) {
+			ipv6_regentempaddr0(ia, &tv);
+			ia->flags &= ~IPV6_AF_REGEN;
+		}
+	}
 }
 #endif /* IPV6_MANAGETEMPADDR */
 
@@ -2176,13 +2211,11 @@ inet6_makeprefix(struct interface *ifp, const struct ra *rap,
 	}
 
 	/* There is no point in trying to manage a /128 prefix,
-	 * ones without a lifetime or ones not on link or delegated */
-	if (addr->prefix_len == 128 ||
-	    addr->prefix_vltime == 0 ||
-	    !(addr->flags & (IPV6_AF_ONLINK | IPV6_AF_DELEGATEDPFX)))
+	 * ones without a lifetime.  */
+	if (addr->prefix_len == 128 || addr->prefix_vltime == 0)
 		return NULL;
 
-	/* Don't install a reject route when not creating bigger prefixes */
+	/* Don't install a reject route when not creating bigger prefixes. */
 	if (addr->flags & IPV6_AF_NOREJECT)
 		return NULL;
 
@@ -2214,7 +2247,9 @@ inet6_makeprefix(struct interface *ifp, const struct ra *rap,
 #ifndef __linux__
 		sa_in6_init(&rt->rt_gateway, &in6addr_loopback);
 #endif
-	} else
+	} else if (!(addr->flags & IPV6_AF_ONLINK))
+		sa_in6_init(&rt->rt_gateway, &rap->from);
+	else
 		rt->rt_gateway.sa_family = AF_UNSPEC;
 	sa_in6_init(&rt->rt_ifa, &addr->addr);
 	return rt;
@@ -2238,7 +2273,7 @@ inet6_makerouter(struct ra *rap)
 	    IN6_ARE_ADDR_EQUAL(&((rtp)->mask), &in6addr_any))
 
 static int
-inet6_staticroutes(struct rt_head *routes, struct dhcpcd_ctx *ctx)
+inet6_staticroutes(rb_tree_t *routes, struct dhcpcd_ctx *ctx)
 {
 	struct interface *ifp;
 	struct ipv6_state *state;
@@ -2254,7 +2289,7 @@ inet6_staticroutes(struct rt_head *routes, struct dhcpcd_ctx *ctx)
 			{
 				rt = inet6_makeprefix(ifp, NULL, ia);
 				if (rt)
-					TAILQ_INSERT_TAIL(routes, rt, rt_next);
+					rt_proto_add(routes, rt);
 			}
 		}
 	}
@@ -2262,15 +2297,17 @@ inet6_staticroutes(struct rt_head *routes, struct dhcpcd_ctx *ctx)
 }
 
 static int
-inet6_raroutes(struct rt_head *routes, struct dhcpcd_ctx *ctx, int expired,
-    bool *have_default)
+inet6_raroutes(rb_tree_t *routes, struct dhcpcd_ctx *ctx)
 {
 	struct rt *rt;
 	struct ra *rap;
 	const struct ipv6_addr *addr;
 
+	if (ctx->ra_routers == NULL)
+		return 0;
+
 	TAILQ_FOREACH(rap, ctx->ra_routers, next) {
-		if (rap->expired != expired)
+		if (rap->expired)
 			continue;
 		TAILQ_FOREACH(addr, &rap->addrs, next) {
 			if (addr->prefix_vltime == 0)
@@ -2278,24 +2315,31 @@ inet6_raroutes(struct rt_head *routes, struct dhcpcd_ctx *ctx, int expired,
 			rt = inet6_makeprefix(rap->iface, rap, addr);
 			if (rt) {
 				rt->rt_dflags |= RTDF_RA;
-				TAILQ_INSERT_TAIL(routes, rt, rt_next);
+#ifdef HAVE_ROUTE_PREF
+				rt->rt_pref = ipv6nd_rtpref(rap);
+#endif
+				rt_proto_add(routes, rt);
 			}
 		}
-		if (rap->lifetime) {
-			rt = inet6_makerouter(rap);
-			if (rt) {
-				rt->rt_dflags |= RTDF_RA;
-				TAILQ_INSERT_TAIL(routes, rt, rt_next);
-				if (have_default)
-					*have_default = true;
-			}
-		}
+		if (rap->lifetime == 0)
+			continue;
+		if (ipv6_anyglobal(rap->iface) == NULL)
+			continue;
+		rt = inet6_makerouter(rap);
+		if (rt == NULL)
+			continue;
+		rt->rt_dflags |= RTDF_RA;
+#ifdef HAVE_ROUTE_PREF
+		rt->rt_pref = ipv6nd_rtpref(rap);
+#endif
+		rt_proto_add(routes, rt);
 	}
 	return 0;
 }
 
+#ifdef DHCP6
 static int
-inet6_dhcproutes(struct rt_head *routes, struct dhcpcd_ctx *ctx,
+inet6_dhcproutes(rb_tree_t *routes, struct dhcpcd_ctx *ctx,
     enum DH6S dstate)
 {
 	struct interface *ifp;
@@ -2308,52 +2352,37 @@ inet6_dhcproutes(struct rt_head *routes, struct dhcpcd_ctx *ctx,
 		if (d6_state && d6_state->state == dstate) {
 			TAILQ_FOREACH(addr, &d6_state->addrs, next) {
 				rt = inet6_makeprefix(ifp, NULL, addr);
-				if (rt) {
-					rt->rt_dflags |= RTDF_DHCP;
-					TAILQ_INSERT_TAIL(routes, rt, rt_next);
-				}
+				if (rt == NULL)
+					continue;
+				rt->rt_dflags |= RTDF_DHCP;
+				rt_proto_add(routes, rt);
 			}
 		}
 	}
 	return 0;
 }
+#endif
 
 bool
-inet6_getroutes(struct dhcpcd_ctx *ctx, struct rt_head *routes)
+inet6_getroutes(struct dhcpcd_ctx *ctx, rb_tree_t *routes)
 {
-	bool have_default;
 
 	/* Should static take priority? */
 	if (inet6_staticroutes(routes, ctx) == -1)
 		return false;
 
 	/* First add reachable routers and their prefixes */
-	have_default = false;
-	if (inet6_raroutes(routes, ctx, 0, &have_default) == -1)
+	if (inet6_raroutes(routes, ctx) == -1)
 		return false;
 
+#ifdef DHCP6
 	/* We have no way of knowing if prefixes added by DHCP are reachable
 	 * or not, so we have to assume they are.
-	 * Add bound before delegated so we can prefer interfaces better */
+	 * Add bound before delegated so we can prefer interfaces better. */
 	if (inet6_dhcproutes(routes, ctx, DH6S_BOUND) == -1)
 		return false;
 	if (inet6_dhcproutes(routes, ctx, DH6S_DELEGATED) == -1)
 		return false;
-
-#ifdef HAVE_ROUTE_METRIC
-	/* If we have an unreachable router, we really do need to remove the
-	 * route to it beause it could be a lower metric than a reachable
-	 * router. Of course, we should at least have some routers if all
-	 * are unreachable. */
-	if (!have_default) {
-#endif
-	/* Add our non-reachable routers and prefixes
-	 * Unsure if this is needed, but it's a close match to kernel
-	 * behaviour */
-		if (inet6_raroutes(routes, ctx, 1, NULL) == -1)
-			return false;
-#ifdef HAVE_ROUTE_METRIC
-	}
 #endif
 
 	return true;

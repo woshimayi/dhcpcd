@@ -1,6 +1,7 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * dhcpcd - DHCP client daemon
- * Copyright (c) 2006-2018 Roy Marples <roy@marples.name>
+ * Copyright (c) 2006-2020 Roy Marples <roy@marples.name>
  * All rights reserved
 
  * Redistribution and use in source and binary forms, with or without
@@ -44,8 +45,6 @@
 #  endif
 #endif
 
-#define ALLROUTERS "ff02::2"
-
 #define EUI64_GBIT		0x01
 #define EUI64_UBIT		0x02
 #define EUI64_TO_IFID(in6)	do {(in6)->s6_addr[8] ^= EUI64_UBIT; } while (0)
@@ -60,13 +59,16 @@
 #define TEMP_PREFERRED_LIFETIME	86400	/* 1 day */
 #define REGEN_ADVANCE		5	/* seconds */
 #define MAX_DESYNC_FACTOR	600	/* 10 minutes */
-
 #define TEMP_IDGEN_RETRIES	3
-#define GEN_TEMPID_RETRY_MAX	5
 
 /* RFC7217 constants */
 #define IDGEN_RETRIES	3
 #define IDGEN_DELAY	1 /* second */
+
+/* Interface identifier length. Prefix + this == 128 for autoconf */
+#define ipv6_ifidlen(ifp)	64
+#define	IA6_CANAUTOCONF(ia)	\
+	((ia)->prefix_len + ipv6_ifidlen((ia)->iface) == 128)
 
 #ifndef IN6_ARE_MASKED_ADDR_EQUAL
 #define IN6_ARE_MASKED_ADDR_EQUAL(d, a, m)	(	\
@@ -74,6 +76,17 @@
 	(((d)->s6_addr32[1] ^ (a)->s6_addr32[1]) & (m)->s6_addr32[1]) == 0 && \
 	(((d)->s6_addr32[2] ^ (a)->s6_addr32[2]) & (m)->s6_addr32[2]) == 0 && \
 	(((d)->s6_addr32[3] ^ (a)->s6_addr32[3]) & (m)->s6_addr32[3]) == 0 )
+#endif
+
+#ifndef IN6ADDR_LINKLOCAL_ALLNODES_INIT
+#define	IN6ADDR_LINKLOCAL_ALLNODES_INIT				\
+	{{{ 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,	\
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 }}}
+#endif
+#ifndef IN6ADDR_LINKLOCAL_ALLROUTERS_INIT
+#define	IN6ADDR_LINKLOCAL_ALLROUTERS_INIT			\
+	{{{ 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,	\
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 }}}
 #endif
 
 /*
@@ -90,8 +103,14 @@
 #endif
 
 /* This was fixed in NetBSD */
-#if defined(__NetBSD_Version__) && __NetBSD_Version__ >= 699002000
+#if (defined(__DragonFly_version) && __DragonFly_version >= 500704) || \
+    (defined(__NetBSD_Version__) && __NetBSD_Version__ >= 699002000)
 #  undef IPV6_POLLADDRFLAG
+#endif
+
+/* Of course OpenBSD has their own special name. */
+#if !defined(IN6_IFF_TEMPORARY) && defined(IN6_IFF_PRIVACY)
+#define	IN6_IFF_TEMPORARY IN6_IFF_PRIVACY
 #endif
 
 #ifdef __sun
@@ -99,9 +118,9 @@
     * While it supports DaD, to seems to only expose IFF_DUPLICATE
     * so we have no way of knowing if it's tentative or not.
     * I don't even know if Solaris has any special treatment for tentative. */
-#  define IN6_IFF_TENTATIVE	0
+#  define IN6_IFF_TENTATIVE	0x02
 #  define IN6_IFF_DUPLICATED	0x04
-#  define IN6_IFF_DETACHED	0
+#  define IN6_IFF_DETACHED	0x00
 #endif
 
 #define IN6_IFF_NOTUSEABLE \
@@ -139,6 +158,20 @@
 #  define IN6_IFF_DETACHED	0
 #endif
 
+/*
+ * ND6 Advertising is only used for IP address sharing to prefer
+ * the address on a specific interface.
+ * This just fails to work on OpenBSD and causes erroneous duplicate
+ * address messages on BSD's other then DragonFly and NetBSD.
+ */
+#if !defined(SMALL) && \
+    ((defined(__DragonFly_version) && __DragonFly_version >= 500703) || \
+    (defined(__NetBSD_Version__) && __NetBSD_Version__ >= 899002800) || \
+    defined(__linux__) || defined(__sun))
+#  define ND6_ADVERTISE
+#endif
+
+#ifdef INET6
 TAILQ_HEAD(ipv6_addrhead, ipv6_addr);
 struct ipv6_addr {
 	TAILQ_ENTRY(ipv6_addr) next;
@@ -169,6 +202,10 @@ struct ipv6_addr {
 	void (*dadcallback)(void *);
 	int dadcounter;
 
+	struct nd_neighbor_advert *na;
+	size_t na_len;
+	int na_count;
+
 #ifdef ALIAS_ADDR
 	char alias[IF_NAMESIZE];
 #endif
@@ -179,18 +216,19 @@ struct ipv6_addr {
 #define	IPV6_AF_STALE		(1U << 2)
 #define	IPV6_AF_ADDED		(1U << 3)
 #define	IPV6_AF_AUTOCONF	(1U << 4)
-#define	IPV6_AF_DUPLICATED	(1U << 5)
-#define	IPV6_AF_DADCOMPLETED	(1U << 6)
-#define	IPV6_AF_DELEGATED	(1U << 7)
-#define	IPV6_AF_DELEGATEDPFX	(1U << 8)
-#define	IPV6_AF_NOREJECT	(1U << 9)
-#define	IPV6_AF_REQUEST		(1U << 10)
-#define	IPV6_AF_STATIC		(1U << 11)
-#define	IPV6_AF_DELEGATEDLOG	(1U << 12)
-#define	IPV6_AF_RAPFX		(1U << 13)
-#define	IPV6_AF_EXTENDED	(1U << 14)
+#define	IPV6_AF_DADCOMPLETED	(1U << 5)
+#define	IPV6_AF_DELEGATED	(1U << 6)
+#define	IPV6_AF_DELEGATEDPFX	(1U << 7)
+#define	IPV6_AF_NOREJECT	(1U << 8)
+#define	IPV6_AF_REQUEST		(1U << 9)
+#define	IPV6_AF_STATIC		(1U << 10)
+#define	IPV6_AF_DELEGATEDLOG	(1U << 11)
+#define	IPV6_AF_RAPFX		(1U << 12)
+#define	IPV6_AF_EXTENDED	(1U << 13)
+#define	IPV6_AF_REGEN		(1U << 14)
+#define	IPV6_AF_ROUTER		(1U << 15)
 #ifdef IPV6_MANAGETEMPADDR
-#define	IPV6_AF_TEMPORARY	(1U << 15)
+#define	IPV6_AF_TEMPORARY	(1U << 16)
 #endif
 
 struct ll_callback {
@@ -205,10 +243,7 @@ struct ipv6_state {
 	struct ll_callback_head ll_callbacks;
 
 #ifdef IPV6_MANAGETEMPADDR
-	time_t desync_factor;
-	uint8_t randomseed0[8]; /* upper 64 bits of MD5 digest */
-	uint8_t randomseed1[8]; /* lower 64 bits */
-	uint8_t randomid[8];
+	uint32_t desync_factor;
 #endif
 };
 
@@ -218,14 +253,12 @@ struct ipv6_state {
 	((const struct ipv6_state *)(ifp)->if_data[IF_DATA_IPV6])
 #define IPV6_STATE_RUNNING(ifp) ipv6_staticdadcompleted((ifp))
 
-#ifdef INET6
 
 int ipv6_init(struct dhcpcd_ctx *);
-int ipv6_makestableprivate(struct in6_addr *addr,
-    const struct in6_addr *prefix, int prefix_len,
-    const struct interface *ifp, int *dad_counter);
+int ipv6_makestableprivate(struct in6_addr *,
+    const struct in6_addr *, int, const struct interface *, int *);
 int ipv6_makeaddr(struct in6_addr *, struct interface *,
-    const struct in6_addr *, int);
+    const struct in6_addr *, int, unsigned int);
 int ipv6_mask(struct in6_addr *, int);
 uint8_t ipv6_prefixlen(const struct in6_addr *);
 int ipv6_userprefix( const struct in6_addr *, short prefix_len,
@@ -234,6 +267,7 @@ void ipv6_checkaddrflags(void *);
 void ipv6_markaddrsstale(struct interface *, unsigned int);
 void ipv6_deletestaleaddrs(struct interface *);
 int ipv6_addaddr(struct ipv6_addr *, const struct timespec *);
+int ipv6_doaddr(struct ipv6_addr *, struct timespec *);
 ssize_t ipv6_addaddrs(struct ipv6_addrhead *addrs);
 void ipv6_deleteaddr(struct ipv6_addr *);
 void ipv6_freedrop_addrs(struct ipv6_addrhead *, int,
@@ -245,6 +279,7 @@ int ipv6_handleifa_addrs(int, struct ipv6_addrhead *, const struct ipv6_addr *,
 struct ipv6_addr *ipv6_iffindaddr(struct interface *,
     const struct in6_addr *, int);
 int ipv6_hasaddr(const struct interface *);
+struct ipv6_addr *ipv6_anyglobal(struct interface *);
 int ipv6_findaddrmatch(const struct ipv6_addr *, const struct in6_addr *,
     unsigned int);
 struct ipv6_addr *ipv6_findaddr(struct dhcpcd_ctx *,
@@ -253,40 +288,29 @@ struct ipv6_addr *ipv6_findmaskaddr(struct dhcpcd_ctx *,
     const struct in6_addr *);
 #define ipv6_linklocal(ifp) ipv6_iffindaddr((ifp), NULL, IN6_IFF_NOTUSEABLE)
 int ipv6_addlinklocalcallback(struct interface *, void (*)(void *), void *);
-struct ipv6_addr *ipv6_newaddr(struct interface *, const struct in6_addr *, uint8_t,
-    unsigned int);
+void ipv6_setscope(struct sockaddr_in6 *, unsigned int);
+unsigned int ipv6_getscope(const struct sockaddr_in6 *);
+struct ipv6_addr *ipv6_newaddr(struct interface *, const struct in6_addr *,
+    uint8_t, unsigned int);
 void ipv6_freeaddr(struct ipv6_addr *);
 void ipv6_freedrop(struct interface *, int);
 #define ipv6_free(ifp) ipv6_freedrop((ifp), 0)
 #define ipv6_drop(ifp) ipv6_freedrop((ifp), 2)
 
 #ifdef IPV6_MANAGETEMPADDR
-void ipv6_gentempifid(struct interface *);
 struct ipv6_addr *ipv6_createtempaddr(struct ipv6_addr *,
     const struct timespec *);
 struct ipv6_addr *ipv6_settemptime(struct ipv6_addr *, int);
 void ipv6_addtempaddrs(struct interface *, const struct timespec *);
-#else
-#define ipv6_gentempifid(a) {}
-#define ipv6_settempstale(a) {}
+void ipv6_regentempaddrs(void *);
 #endif
 
 int ipv6_start(struct interface *);
 int ipv6_staticdadcompleted(const struct interface *);
 int ipv6_startstatic(struct interface *);
-ssize_t ipv6_env(char **, const char *, const struct interface *);
+ssize_t ipv6_env(FILE *, const char *, const struct interface *);
 void ipv6_ctxfree(struct dhcpcd_ctx *);
-bool inet6_getroutes(struct dhcpcd_ctx *, struct rt_head *);
+bool inet6_getroutes(struct dhcpcd_ctx *, rb_tree_t *);
+#endif /* INET6 */
 
-#else
-#define ipv6_start(a) (-1)
-#define ipv6_startstatic(a)
-#define ipv6_staticdadcompleted(a) (0)
-#define ipv6_hasaddr(a) (0)
-#define ipv6_free_ll_callbacks(a) {}
-#define ipv6_free(a) {}
-#define ipv6_ctxfree(a) {}
-#define ipv6_gentempifid(a) {}
-#endif
-
-#endif
+#endif /* INET6_H */

@@ -1,6 +1,7 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * dhcpcd - DHCP client daemon
- * Copyright (c) 2006-2018 Roy Marples <roy@marples.name>
+ * Copyright (c) 2006-2020 Roy Marples <roy@marples.name>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -38,17 +39,29 @@
 #include "logerr.h"
 
 int
-dev_initialized(struct dhcpcd_ctx *ctx, const char *ifname)
+dev_initialised(struct dhcpcd_ctx *ctx, const char *ifname)
 {
+
+#ifdef PRIVSEP
+	if (ctx->options & DHCPCD_PRIVSEP &&
+	    !(ctx->options & DHCPCD_PRIVSEPROOT))
+		return ps_root_dev_initialised(ctx, ifname);
+#endif
 
 	if (ctx->dev == NULL)
 		return 1;
-	return ctx->dev->initialized(ifname);
+	return ctx->dev->initialised(ifname);
 }
 
 int
 dev_listening(struct dhcpcd_ctx *ctx)
 {
+
+#ifdef PRIVSEP
+	if (ctx->options & DHCPCD_PRIVSEP &&
+	    !(ctx->options & DHCPCD_PRIVSEPROOT))
+		return ps_root_dev_listening(ctx);
+#endif
 
 	if (ctx->dev == NULL)
 		return 0;
@@ -78,17 +91,17 @@ void
 dev_stop(struct dhcpcd_ctx *ctx)
 {
 
-	dev_stop1(ctx,!(ctx->options & DHCPCD_FORKED));
+	dev_stop1(ctx, !(ctx->options & DHCPCD_FORKED));
 }
 
 static int
-dev_start2(struct dhcpcd_ctx *ctx, const char *name)
+dev_start2(struct dhcpcd_ctx *ctx, const struct dev_dhcpcd *dev_dhcpcd,
+    const char *name)
 {
 	char file[PATH_MAX];
 	void *h;
 	void (*fptr)(struct dev *, const struct dev_dhcpcd *);
 	int r;
-	struct dev_dhcpcd dev_dhcpcd;
 
 	snprintf(file, sizeof(file), DEVDIR "/%s", name);
 	h = dlopen(file, RTLD_LAZY);
@@ -96,8 +109,7 @@ dev_start2(struct dhcpcd_ctx *ctx, const char *name)
 		logerrx("dlopen: %s", dlerror());
 		return -1;
 	}
-	fptr = (void (*)(struct dev *, const struct dev_dhcpcd *))
-	    dlsym(h, "dev_init");
+	fptr = dlsym(h, "dev_init");
 	if (fptr == NULL) {
 		logerrx("dlsym: %s", dlerror());
 		dlclose(h);
@@ -108,8 +120,7 @@ dev_start2(struct dhcpcd_ctx *ctx, const char *name)
 		dlclose(h);
 		return -1;
 	}
-	dev_dhcpcd.handle_interface = &dhcpcd_handleinterface;
-	fptr(ctx->dev, &dev_dhcpcd);
+	fptr(ctx->dev, dev_dhcpcd);
 	if (ctx->dev->start  == NULL || (r = ctx->dev->start()) == -1) {
 		free(ctx->dev);
 		ctx->dev = NULL;
@@ -122,7 +133,7 @@ dev_start2(struct dhcpcd_ctx *ctx, const char *name)
 }
 
 static int
-dev_start1(struct dhcpcd_ctx *ctx)
+dev_start1(struct dhcpcd_ctx *ctx, const struct dev_dhcpcd *dev_dhcpcd)
 {
 	DIR *dp;
 	struct dirent *d;
@@ -134,7 +145,7 @@ dev_start1(struct dhcpcd_ctx *ctx)
 	}
 
 	if (ctx->dev_load)
-		return dev_start2(ctx, ctx->dev_load);
+		return dev_start2(ctx, dev_dhcpcd, ctx->dev_load);
 
 	dp = opendir(DEVDIR);
 	if (dp == NULL) {
@@ -147,7 +158,7 @@ dev_start1(struct dhcpcd_ctx *ctx)
 		if (d->d_name[0] == '.')
 			continue;
 
-		r = dev_start2(ctx, d->d_name);
+		r = dev_start2(ctx, dev_dhcpcd, d->d_name);
 		if (r != -1)
 			break;
 	}
@@ -167,15 +178,18 @@ dev_handle_data(void *arg)
 }
 
 int
-dev_start(struct dhcpcd_ctx *ctx)
+dev_start(struct dhcpcd_ctx *ctx, int (*handler)(void *, int, const char *))
 {
+	struct dev_dhcpcd dev_dhcpcd = {
+		.handle_interface = handler,
+	};
 
 	if (ctx->dev_fd != -1) {
 		logerrx("%s: already started on fd %d", __func__, ctx->dev_fd);
 		return ctx->dev_fd;
 	}
 
-	ctx->dev_fd = dev_start1(ctx);
+	ctx->dev_fd = dev_start1(ctx, &dev_dhcpcd);
 	if (ctx->dev_fd != -1) {
 		if (eloop_event_add(ctx->eloop, ctx->dev_fd,
 		    dev_handle_data, ctx) == -1)

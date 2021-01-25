@@ -19,10 +19,17 @@ dhcpcd.8
 dhcpcd-run-hooks
 dhcpcd-run-hooks.8
 dhcpcd.conf.5
+hooks/30-hostname
 hooks/50-ypbind
 
 # Ignore distribution
 dhcpcd*.xz*
+
+# Ignore patch files
+*.diff
+*.patch
+*.orig
+*.rej
 
 # Ignore swap files
 *.swp

@@ -8,10 +8,11 @@ MAN8=		dhcpcd-run-hooks.8
 CLEANFILES+=	dhcpcd-run-hooks.8
 
 SCRIPTSDIR=	${HOOKDIR}
-SCRIPTS=	01-test 02-dump
+SCRIPTS=	01-test
 SCRIPTS+=	20-resolv.conf
 SCRIPTS+=	30-hostname
 SCRIPTS+=	${HOOKSCRIPTS}
+CLEANFILES+=	30-hostname
 
 # Some hooks should not be installed by default
 FILESDIR=	${DATADIR}/dhcpcd/hooks
@@ -27,6 +28,7 @@ FILES+=		${EGHOOKSCRIPTS}
 		${SED_SYS} ${SED_SCRIPT} ${SED_DATADIR} \
 		${SED_SERVICEEXISTS} ${SED_SERVICECMD} ${SED_SERVICESTATUS} \
 		${SED_STATUSARG} \
+		${SED_DEFAULT_HOSTNAME} \
 		-e 's:@YPDOMAIN_DIR@:${YPDOMAIN_DIR}:g' \
 		-e 's:@YPDOMAIN_SUFFIX@:${YPDOMAIN_SUFFIX}:g' \
 		$< > $@
@@ -36,9 +38,12 @@ all: ${PROG} ${MAN8} ${SCRIPTS} ${EGHOOKSCRIPTS}
 clean:
 	rm -f ${CLEANFILES} 50-ypbind
 
+distclean: clean
+	rm -f *.diff *.patch *.orig *.rej
+
 depend:
 
-proginstall: ${PROG} ${HOOKSCRIPTS}
+proginstall: ${PROG} ${SCRIPTS}
 	${INSTALL} -d ${DESTDIR}${BINDIR}
 	${INSTALL} -m ${BINMODE} ${PROG} ${DESTDIR}${BINDIR}
 	${INSTALL} -d ${DESTDIR}${SCRIPTSDIR}
@@ -46,7 +51,7 @@ proginstall: ${PROG} ${HOOKSCRIPTS}
 	# We need to remove the old MTU change script if we at all can.
 	rm -f ${DESTDIR}${SCRIPTSDIR}/10-mtu
 
-eginstall: ${EGHOOKSCRIPTS}
+eginstall: ${FILES}
 	${INSTALL} -d ${DESTDIR}${FILESDIR}
 	${INSTALL} -m ${NONBINMODE} ${FILES} ${DESTDIR}${FILESDIR}
 
@@ -56,9 +61,19 @@ maninstall: ${MAN8}
 
 install: proginstall eginstall maninstall
 
-import: ${HOOKSCRIPTS}
+import: ${SCRIPTS} ${FILES}
 	${INSTALL} -d /tmp/${DISTPREFIX}/dhcpcd-hooks
 	${INSTALL} -m ${NONBINMODE} ${SCRIPTS} /tmp/${DISTPREFIX}/dhcpcd-hooks
 	${INSTALL} -m ${NONBINMODE} ${FILES} /tmp/${DISTPREFIX}/dhcpcd-hooks
+
+_import-src:
+	${INSTALL} -d ${DESTDIR}/hooks
+	cp dhcpcd-run-hooks.in dhcpcd-run-hooks.8.in [0-9]* ${DESTDIR}/hooks
+	rm ${DESTDIR}/hooks/50-dhcpcd-compat
+	if [ `uname` = Linux ]; then \
+		rm ${DESTDIR}/hooks/50-ypbind.in; \
+	else \
+		rm ${DESTDIR}/hooks/50-yp.conf; \
+	fi
 
 include ${TOP}/Makefile.inc

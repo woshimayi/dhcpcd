@@ -1,6 +1,7 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * dhcpcd - DHCP client daemon
- * Copyright (c) 2006-2018 Roy Marples <roy@marples.name>
+ * Copyright (c) 2006-2020 Roy Marples <roy@marples.name>
  * All rights reserved
 
  * Redistribution and use in source and binary forms, with or without
@@ -40,6 +41,7 @@
 #include <stdint.h>
 
 #include "arp.h"
+#include "bpf.h"
 #include "auth.h"
 #include "dhcp-common.h"
 
@@ -114,6 +116,7 @@ enum DHO {
 	DHO_RAPIDCOMMIT            = 80,  /* RFC 4039 */
 	DHO_FQDN                   = 81,
 	DHO_AUTHENTICATION         = 90,  /* RFC 3118 */
+	DHO_IPV6_PREFERRED_ONLY    = 108, /* RFC 8925 */
 	DHO_AUTOCONFIGURE          = 116, /* RFC 2563 */
 	DHO_DNSSEARCH              = 119, /* RFC 3397 */
 	DHO_CSR                    = 121, /* RFC 3442 */
@@ -136,6 +139,8 @@ enum FQDN {
 	FQDN_PTR        = 0x20,
 	FQDN_BOTH       = 0x31
 };
+
+#define	MIN_V6ONLY_WAIT		300 /* seconds, RFC 8925 */
 
 /* Sizes for BOOTP options */
 #define	BOOTP_CHADDR_LEN	 16
@@ -163,6 +168,8 @@ struct bootp {
 	/* DHCP allows a variable length vendor area */
 };
 
+#define	DHCP_MIN_LEN		(offsetof(struct bootp, vend) + 4)
+
 struct bootp_pkt
 {
 	struct ip ip;
@@ -181,6 +188,10 @@ struct dhcp_lease {
 	uint8_t frominfo;
 	uint32_t cookie;
 };
+
+#ifndef DHCP_INFINITE_LIFETIME
+#  define DHCP_INFINITE_LIFETIME	(~0U)
+#endif
 
 enum DHS {
 	DHS_NONE,
@@ -209,13 +220,13 @@ struct dhcp_state {
 	size_t old_len;
 	struct dhcp_lease lease;
 	const char *reason;
-	time_t interval;
-	time_t nakoff;
+	unsigned int interval;
+	unsigned int nakoff;
 	uint32_t xid;
 	int socket;
 
-	int bpf_fd;
-	unsigned int bpf_flags;
+	struct bpf *bpf;
+	int udp_rfd;
 	struct ipv4_addr *addr;
 	uint8_t added;
 
@@ -228,6 +239,7 @@ struct dhcp_state {
 #endif
 };
 
+#ifdef INET
 #define D_STATE(ifp)							       \
 	((struct dhcp_state *)(ifp)->if_data[IF_DATA_DHCP])
 #define D_CSTATE(ifp)							       \
@@ -243,18 +255,20 @@ struct dhcp_state {
 #include "dhcpcd.h"
 #include "if-options.h"
 
-#ifdef INET
-char *decode_rfc3361(const uint8_t *, size_t);
-ssize_t decode_rfc3442(char *, size_t, const uint8_t *p, size_t);
+ssize_t print_rfc3361(FILE *, const uint8_t *, size_t);
+ssize_t print_rfc3442(FILE *, const uint8_t *, size_t);
 
+int dhcp_openudp(struct in_addr *);
+void dhcp_packet(struct interface *, uint8_t *, size_t, unsigned int);
+void dhcp_recvmsg(struct dhcpcd_ctx *, struct msghdr *);
 void dhcp_printoptions(const struct dhcpcd_ctx *,
     const struct dhcp_opt *, size_t);
 uint16_t dhcp_get_mtu(const struct interface *);
-int dhcp_get_routes(struct rt_head *, struct interface *);
-ssize_t dhcp_env(char **, const char *, const struct bootp *, size_t,
-    const struct interface *);
+int dhcp_get_routes(rb_tree_t *, struct interface *);
+ssize_t dhcp_env(FILE *, const char *, const struct interface *,
+    const struct bootp *, size_t);
 
-void dhcp_handleifa(int, struct ipv4_addr *, pid_t pid);
+struct ipv4_addr *dhcp_handleifa(int, struct ipv4_addr *, pid_t pid);
 void dhcp_drop(struct interface *, const char *);
 void dhcp_start(struct interface *);
 void dhcp_abort(struct interface *);
@@ -266,15 +280,6 @@ void dhcp_reboot_newopts(struct interface *, unsigned long long);
 void dhcp_close(struct interface *);
 void dhcp_free(struct interface *);
 int dhcp_dump(struct interface *);
-#else
-#define dhcp_start(a) {}
-#define dhcp_abort(a) {}
-#define dhcp_renew(a) {}
-#define dhcp_reboot(a, b) (b = b)
-#define dhcp_reboot_newopts(a, b) (b = b)
-#define dhcp_close(a) {}
-#define dhcp_free(a) {}
-#define dhcp_dump(a) (-1)
-#endif
+#endif /* INET */
 
-#endif
+#endif /* DHCP_H */

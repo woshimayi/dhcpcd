@@ -3,16 +3,14 @@
 This attempts to document various ways of building dhcpcd for your
 platform.
 
-Building for distribution (ie making a dhcpcd source tarball) now requires
-gmake-4 or any BSD make.
-
 ## Size is an issue
 To compile small dhcpcd, maybe to be used for installation media where
 size is a concern, you can use the `--small` configure option to enable
 a reduced feature set within dhcpcd.
 Currently this just removes non important options out of
-`dhcpcd-definitions.conf`, the logfile option and
-support for DHCPv6 Prefix Delegation.
+`dhcpcd-definitions.conf`, the logfile option,
+DHCPv6 Prefix Delegation and IPv6 address announcement *(to prefer an
+address on another interface)*.
 Other features maybe dropped as and when required.
 dhcpcd can also be made smaller by removing the IPv4 or IPv6 stack:
   *  `--disable-inet`
@@ -24,6 +22,7 @@ Or by removing the following features:
   *  `--disable-arping`
   *  `--disable-ipv4ll`
   *  `--disable-dhcp6`
+  *  `--disable-privsep`
 
 You can also move the embedded extended configuration from the dhcpcd binary
 to an external file (LIBEXECDIR/dhcpcd-definitions.conf)
@@ -61,6 +60,14 @@ regardless of the version for your CPU. As such, Arch presently ships a
 management and no automatic prefix route generation, both of which are
 obviously false. You will have to patch support either in the kernel or
 out of the headers (or dhcpcd itself) to have correct operation.
+
+Linux netlink headers cause a sign conversion error.
+I [submitted a patch](https://lkml.org/lkml/2019/12/17/680),
+but as yet it's not upstreamed.
+
+GLIBC ships an icmp6.h header which will result in signedness warnings.
+Their [bug #22489](https://sourceware.org/bugzilla/show_bug.cgi?id=22489)
+will solve this once it's actually applied.
 
 ## OS specific issues
 Some BSD systems do not allow the manipulation of automatically added subnet
@@ -122,32 +129,19 @@ You can disable this with `--without-dev`, or `without-udev`.
 NOTE: in Gentoo at least, `sys-fs/udev` as provided by systemd leaks memory
 `sys-fs/eudev`, the fork of udev does not and as such is recommended.
 
-## select
-dhcpcd uses eloop.c, which is a portable main event loop with timeouts and
-signal handling. Unlike libevent and similar, it can be transplanted directly
-within the application - the only caveat outside of POSIX calls is that
-you provide queue.h based on a recent BSD (glibc sys/queue.h is not enough).
-eloop supports the following polling mechanisms, listed in order of preference:
-	kqueue, epoll, pollts, ppoll and pselect.
-If signal handling is disabled (ie in RTEMS or other single process
-OS's) then eloop can use poll.
-You can decide which polling mechanism dhcpcd will select in eloop like so
-`./configure --with-poll=[kqueue|epoll|pselect|pollts|ppoll]`
-
 
 ## Importing into another source control system
-To prepare dhcpcd for import into a platform source tree (like NetBSD)
-you can use the make import target to create /tmp/dhcpcd-$version and
-populate it with all the source files and hooks needed.
-In this instance, you may wish to disable some configured tests when
-the binary has to run on older versions which lack support, such as getline.
-`./configure --without-getline`
+To import the full sources, use the import target.
+To import only the needed sources and documentation, use the import-src
+target.
+Both targets support DESTDIR to set the installation directory,
+if unset it defaults to `/tmp/dhcpcd-$VERSION`
+Example: `make DESTDIR=/usr/src/contrib/dhcpcd import-src`
 
 
 ## Hooks
 Not all the hooks in dhcpcd-hooks are installed by default.
-By default we install `01-test`, `02-dump`, `10-mtu`, `20-resolv.conf`
-and `30-hostname`.
+By default we install `01-test`, `20-resolv.conf`and `30-hostname`.
 The other hooks, `10-wpa_supplicant`, `15-timezone` and `29-lookup-hostname`
 are installed to `$(datadir)/dhcpcd/hooks` by default and need to be
 copied to `$(libexecdir)/dhcpcd-hooks` for use.
@@ -155,17 +149,10 @@ The configure program attempts to find hooks for systems you have installed.
 To add more simply
 `./configure -with-hook=ntp.conf`
 
-Some system services expose the name of the service we are in,
-by default dhcpcd will pick `RC_SVCNAME` from the environment.
-You can override this in `CPPFLAGS+= -DRC_SVCNAME="YOUR_SVCNAME"`.
-This is important because dhcpcd will scrub the environment aside from `$PATH`
-before running hooks.
-This variable could be used to facilitate service re-entry so this chain could
-happen in a custom OS hook:
-  dhcpcd service marked inactive && dhcpcd service starts
-  dependant services are not started because dhcpcd is inactive (not stopped)
-  dhcpcd hook tests if `$if_up = true` and `$af_waiting` is empty or unset.
-  if true, mark the dhcpcd service as started and then start dependencies
-  if false and the dhcpcd service was previously started, mark as inactive and
-     stop any dependant services.
-
+If using resolvconf, the `20-resolv.conf` hook now requires a version with the
+`-C` and `-c` options to deprecate and activate interfaces to support wireless
+roaming (Linux) or carrier just drops (NetBSD).
+If your resolvconf does not support this then you will see a warning
+about an illegal option when the carrier changes, but things should still work.
+In this instance the DNS information cannot be Deprecated and may not
+be optimal for multi-homed hosts.

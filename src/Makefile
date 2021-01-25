@@ -15,8 +15,9 @@ CSTD?=		c99
 CFLAGS+=	-std=${CSTD}
 CPPFLAGS+=	-I${TOP} -I${TOP}/src -I./crypt
 
-SRCS+=		${DHCPCD_SRCS}
-DHCPCD_DEFS?=	dhcpcd-definitions.conf
+SRCS+=		${DHCPCD_SRCS} ${PRIVSEP_SRCS}
+DHCPCD_DEF?=	dhcpcd-definitions.conf
+DHCPCD_DEFS=	dhcpcd-definitions.conf dhcpcd-definitions-small.conf
 
 PCOMPAT_SRCS=	${COMPAT_SRCS:compat/%=${TOP}/compat/%}
 PCRYPT_SRCS=	${CRYPT_SRCS:compat/%=${TOP}/compat/%}
@@ -45,7 +46,7 @@ CLEANFILES+=	*.tar.xz
 		$< > $@
 
 all: ${TOP}/config.h ${PROG} ${SCRIPTS} ${MAN5} ${MAN8}
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 dev:
 	cd dev && ${MAKE}
@@ -74,17 +75,17 @@ ${PROG}: ${DEPEND} ${OBJS}
 lint:
 	${LINT} -Suz ${CPPFLAGS} ${SRCS} ${PCRYPT_SRCS} ${PCOMPAT_SRCS}
 
-_embeddedinstall: ${DHCPCD_DEFS}
+_embeddedinstall: ${DHCPCD_DEF}
 	${INSTALL} -d ${DESTDIR}${LIBEXECDIR}
-	${INSTALL} -m ${CONFMODE} ${DHCPCD_DEFS} ${DESTDIR}${LIBEXECDIR}
+	${INSTALL} -m ${CONFMODE} ${DHCPCD_DEF} ${DESTDIR}${LIBEXECDIR}
 
 _proginstall: ${PROG}
 	${INSTALL} -d ${DESTDIR}${SBINDIR}
 	${INSTALL} -m ${BINMODE} ${PROG} ${DESTDIR}${SBINDIR}
-	${INSTALL} -d ${DESTDIR}${DBDIR}
+	${INSTALL} -m ${DBMODE} -d ${DESTDIR}${DBDIR}
 
 proginstall: _proginstall ${EMBEDDEDINSTALL}
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 _maninstall: ${MAN5} ${MAN8}
 	${INSTALL} -d ${DESTDIR}${MANDIR}/man5
@@ -97,32 +98,6 @@ _confinstall:
 	# Install a new default config if not present
 	test -e ${DESTDIR}${SYSCONFDIR}/dhcpcd.conf || \
 		${INSTALL} -m ${CONFMODE} dhcpcd.conf ${DESTDIR}${SYSCONFDIR}
-	# Attempt to move files from sysconfig to dbdir
-	if [ ! -e ${DESTDIR}${DBDIR}/duid -a \
-	    -e ${DESTDIR}${SYSCONFDIR}/dhcpcd.duid ]; \
-	then \
-		mv ${DESTDIR}${SYSCONFDIR}/dhcpcd.duid \
-			${DESTDIR}${DBDIR}/duid; \
-	fi
-	if [ ! -e ${DESTDIR}${DBDIR}/secret -a \
-	    -e ${DESTDIR}${SYSCONFDIR}/dhcpcd.secret ]; \
-	then \
-		mv ${DESTDIR}${SYSCONFDIR}/dhcpcd.secret \
-			${DESTDIR}${DBDIR}/secret; \
-	fi
-	# Move leases to new location
-	for lease in ${DESTDIR}${DBDIR}/../dhcpcd-*.lease*; do \
-		[ -f "$$lease" ] || continue; \
-		newlease=$$(basename "$$lease" | ${SED} -e "s/dhcpcd-//"); \
-		mv "$$lease" ${DESTDIR}${DBDIR}/"$$newlease"; \
-	done
-	# Move RDM monotonic to new location
-	if [ ! -e ${DESTDIR}${DBDIR}/rdm_monotonic -a \
-	    -e ${DESTDIR}${DBDIR}/../dhcpcd-rdm.monotonic ]; \
-	then \
-		mv ${DESTDIR}${DBDIR}/../dhcpcd-rdm.monotonic \
-			${DESTDIR}${DBDIR}/rdm_monotonic; \
-	fi
 	
 eginstall:
 
@@ -130,9 +105,47 @@ install: proginstall _maninstall _confinstall eginstall
 
 clean:
 	rm -f ${OBJS} ${PROG} ${PROG}.core ${CLEANFILES}
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 distclean: clean
 	rm -f .depend
+	rm -f *.diff *.patch *.orig *.rej
+
+_import-src: ${SRCS}
+	${INSTALL} -d ${DESTDIR}/src
+	touch if-bsd.h if-linux.h if-sun.h
+	for x in defs.h ${SRCS} ${SRCS:.c=.h} dev.h ${MAN5}.in ${MAN8}.in; do \
+		cp $$x ${DESTDIR}/src; \
+	done
+	cp dhcpcd.conf ${DESTDIR}/src
+	rm if-bsd.h if-linux.h if-sun.h
+	rm -f ${DESTDIR}/src/if-bsd.h ${DESTDIR}/src/if-linux.h ${DESTDIR}/src/if-sun.h
+	if [ -n "${COMPAT_SRCS}" ]; then \
+		${INSTALL} -d ${DESTDIR}/compat; \
+		cd ..; \
+		touch compat/rb.h compat/strtou.h; \
+		cp ${COMPAT_SRCS} ${COMPAT_SRCS:.c=.h} ${DESTDIR}/compat; \
+		rm compat/rb.h compat/strtou.h; \
+		rm -f ${DESTDIR}/compat/rb.h ${DESTDIR}/compat/strtou.h; \
+	fi
+	if ! grep HAVE_SYS_BITOPS_H ../config.h; then \
+		cp ../compat/bitops.h ${DESTDIR}/compat; \
+	fi
+	if grep compat/consttime_memequal.h ../config.h; then \
+		cp ../compat/consttime_memequal.h ${DESTDIR}/compat; \
+	fi
+	if [ -e ${DESTDIR}/compat/rb.c ]; then \
+		cp ../compat/rbtree.h ${DESTDIR}/compat; \
+	fi
+	if [ -e ${DESTDIR}/compat/strtoi.c ]; then \
+		cp ../compat/_strtoi.h ${DESTDIR}/compat; \
+	fi
+	if [ -n "${CRYPT_SRCS}" ]; then \
+		${INSTALL} -d ${DESTDIR}/compat/crypt; \
+		cd ..; \
+		cp ${CRYPT_SRCS} ${CRYPT_SRCS:.c=.h} ${DESTDIR}/compat/crypt; \
+	fi
+	# DragonFlyBSD builds base version with private crypto
+	if [ `uname` = DragonFly ]; then rm ${DESTDIR}/compat/crypt/md5* ${DESTDIR}/compat/crypt/sha256*; fi
 
 include ${TOP}/Makefile.inc

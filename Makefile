@@ -2,8 +2,7 @@ SUBDIRS=	src hooks
 
 VERSION!=	sed -n 's/\#define VERSION[[:space:]]*"\(.*\)".*/\1/p' src/defs.h
 
-DIST!=		if test -f .fslckout; then echo "dist-fossil"; \
-		elif test -d .git; then echo "dist-git"; \
+DIST!=		if test -d .git; then echo "dist-git"; \
 		else echo "dist-inst"; fi
 FOSSILID?=	current
 GITREF?=	HEAD
@@ -22,10 +21,10 @@ CLEANFILES+=	*.tar.xz
 .SUFFIXES:	.in
 
 all: config.h
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 depend: config.h
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 tests:
 	cd $@; ${MAKE} $@
@@ -36,27 +35,23 @@ hooks:
 	cd $@; ${MAKE}
 
 eginstall:
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 install:
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 proginstall:
-	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 clean:
 	rm -rf cov-int dhcpcd.xz
-	for x in ${SUBDIRS} tests; do cd $$x; ${MAKE} $@; cd ..; done
+	for x in ${SUBDIRS} tests; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 distclean: clean
 	rm -f config.h config.mk config.log \
 		${DISTFILE} ${DISTFILEGZ} ${DISTINFO} ${DISTINFOSIGN}
-
-
-dist-fossil:
-	fossil tarball --name ${DISTPREFIX} ${FOSSILID} ${DISTFILEGZ}
-	gunzip -c ${DISTFILEGZ} | xz >${DISTFILE}
-	rm ${DISTFILEGZ}
+	rm -f *.diff *.patch *.orig *.rej
+	for x in ${SUBDIRS} tests; do cd $$x; ${MAKE} $@ || exit $$?; cd ..; done
 
 dist-git:
 	git archive --prefix=${DISTPREFIX}/ ${GITREF} | xz >${DISTFILE}
@@ -86,9 +81,28 @@ snapshot:
 	tar cf - -C /tmp ${DISTPREFIX} | xz >${DISTFILE}
 	ls -l ${DISTFILE}
 
-import: dist
-	rm -rf /tmp/${DISTPREFIX}
-	${INSTALL} -d /tmp/${DISTPREFIX}
-	tar xvJpf ${DISTFILE} -C /tmp
+_import: dist
+	rm -rf ${DESTDIR}/*
+	${INSTALL} -d ${DESTDIR}
+	tar xvpf ${DISTFILE} -C ${DESTDIR} --strip 1
+	@${ECHO}
+	@${ECHO} "============================================================="
+	@${ECHO} "dhcpcd-${VERSION} imported to ${DESTDIR}"
+
+import:
+	${MAKE} _import DESTDIR=`if [ -n "${DESTDIR}" ]; then echo "${DESTDIR}"; else  echo /tmp/${DISTPREFIX}; fi`
+
+
+_import-src: clean
+	rm -rf ${DESTDIR}/*
+	${INSTALL} -d ${DESTDIR}
+	cp LICENSE README.md ${DESTDIR};
+	for x in ${SUBDIRS}; do cd $$x; ${MAKE} DESTDIR=${DESTDIR} $@ || exit $$?; cd ..; done
+	@${ECHO}
+	@${ECHO} "============================================================="
+	@${ECHO} "dhcpcd-${VERSION} imported to ${DESTDIR}"
+
+import-src:
+	${MAKE} _import-src DESTDIR=`if [ -n "${DESTDIR}" ]; then echo "${DESTDIR}"; else  echo /tmp/${DISTPREFIX}; fi`
 
 include Makefile.inc

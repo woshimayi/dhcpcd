@@ -1,6 +1,7 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * dhcpcd: BPF arp and bootp filtering
- * Copyright (c) 2006-2018 Roy Marples <roy@marples.name>
+ * Copyright (c) 2006-2020 Roy Marples <roy@marples.name>
  * All rights reserved
 
  * Redistribution and use in source and binary forms, with or without
@@ -28,19 +29,53 @@
 #ifndef BPF_HEADER
 #define BPF_HEADER
 
-#define	BPF_READING		(1U << 0)
-#define	BPF_EOF			(1U << 1)
-#define	BPF_PARTIALCSUM		(1U << 2)
+#define	BPF_EOF			0x01U
+#define	BPF_PARTIALCSUM		0x02U
+#define	BPF_BCAST		0x04U
+
+/*
+ * Even though we program the BPF filter should we trust it?
+ * On Linux at least there is a window between opening the socket,
+ * binding the interface and setting the filter where we receive data.
+ * This data is NOT checked OR flushed and IS returned when reading.
+ * We have no way of flushing it other than reading these packets!
+ * But we don't know if they passed the filter or not ..... so we need
+ * to validate each and every packet that comes through ourselves as well.
+ * Even if Linux does fix this sorry state, who is to say other kernels
+ * don't have bugs causing a similar effect?
+ *
+ * As such, let's strive to keep the filters just for pattern matching
+ * to avoid waking dhcpcd up.
+ *
+ * If you want to be notified of any packet failing the BPF filter,
+ * define BPF_DEBUG below.
+ */
+//#define	BPF_DEBUG
 
 #include "dhcpcd.h"
 
+struct bpf {
+	const struct interface *bpf_ifp;
+	int bpf_fd;
+	unsigned int bpf_flags;
+	void *bpf_buffer;
+	size_t bpf_size;
+	size_t bpf_len;
+	size_t bpf_pos;
+};
+
 extern const char *bpf_name;
 size_t bpf_frame_header_len(const struct interface *);
-int bpf_open(struct interface *, int (*)(struct interface *, int));
-int bpf_close(struct interface *, int);
+void *bpf_frame_header_src(const struct interface *, void *, size_t *);
+void *bpf_frame_header_dst(const struct interface *, void *, size_t *);
+int bpf_frame_bcast(const struct interface *, const void *);
+struct bpf * bpf_open(const struct interface *,
+    int (*)(const struct bpf *, const struct in_addr *),
+    const struct in_addr *);
+void bpf_close(struct bpf *);
 int bpf_attach(int, void *, unsigned int);
-ssize_t bpf_send(const struct interface *, int, uint16_t, const void *, size_t);
-ssize_t bpf_read(struct interface *, int, void *, size_t, unsigned int *);
-int bpf_arp(struct interface *, int);
-int bpf_bootp(struct interface *, int);
+ssize_t bpf_send(const struct bpf *, uint16_t, const void *, size_t);
+ssize_t bpf_read(struct bpf *, void *, size_t);
+int bpf_arp(const struct bpf *, const struct in_addr *);
+int bpf_bootp(const struct bpf *, const struct in_addr *);
 #endif

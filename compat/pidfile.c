@@ -86,7 +86,9 @@ pidfile_clean(void)
 	else if (ftruncate(pidfile_fd, 0) == -1)
 		error = errno;
 	else {
-		(void) unlink(pidfile_path);
+#ifndef HAVE_PLEDGE /* Avoid a pledge violating segfault. */
+		(void)unlink(pidfile_path);
+#endif
 		error = 0;
 	}
 
@@ -208,7 +210,7 @@ pidfile_lock(const char *path)
 			goto return_pid;
 #ifndef O_CLOEXEC
 		if ((opts = fcntl(fd, F_GETFD)) == -1 ||
-		    fctnl(fd, F_SETFL, opts | FD_CLOEXEC) == -1)
+		    fcntl(fd, F_SETFL, opts | FD_CLOEXEC) == -1)
 		{
 			int error = errno;
 
